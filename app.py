@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 import requests
 from flask import Flask, request, jsonify
 
@@ -37,6 +38,7 @@ def get_access_token():
 
 
 def fix_distance(activity_id):
+    time.sleep(30)
     token = get_access_token()
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -51,6 +53,10 @@ def fix_distance(activity_id):
         return
 
     original_m = activity["distance"]
+    if original_m == 0:
+        print(f"Activity {activity_id} distance is 0, skipping.")
+        return
+
     original_km = original_m / 1000
     n = int(original_km)
     rounded_km = float(f"{n}.{n:02d}")
@@ -89,7 +95,8 @@ def webhook_receive():
     print(f"Received event: {data}")
     if data.get("object_type") == "activity" and data.get("aspect_type") == "create":
         activity_id = data["object_id"]
-        fix_distance(activity_id)
+        t = threading.Thread(target=fix_distance, args=(activity_id,))
+        t.start()
     return "OK", 200
 
 
