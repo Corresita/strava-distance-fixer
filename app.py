@@ -55,7 +55,8 @@ def fix_distance(activity_id):
 
     original_m = activity["distance"]
     original_km = original_m / 1000
-    rounded_km = round(original_km, 2)
+    n = int(original_km)
+    rounded_km = float(f"{n}.{n:02d}")
     new_m = rounded_km * 1000
 
     print(f"Activity {activity_id}: {original_km:.4f} km → {rounded_km} km")
