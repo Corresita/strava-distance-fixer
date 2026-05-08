@@ -10,12 +10,12 @@ app = Flask(__name__)
 CLIENT_ID = os.environ.get("CLIENT_ID", "236875")
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "b1816d956db3f38e72611d7c79a63e575a033698")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "strava_fixer_token")
-TOKEN_FILE = "/data/tokens.json"
+TOKEN_FILE = "/tmp/tokens.json"
 
 token_store = {
     "access_token": os.environ.get("ACCESS_TOKEN", ""),
     "refresh_token": os.environ.get("REFRESH_TOKEN", ""),
-    "expires_at": 0
+    "expires_at": int(os.environ.get("EXPIRES_AT", "0"))
 }
 token_lock = threading.Lock()
 
