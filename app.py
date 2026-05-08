@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import threading
 import requests
@@ -9,6 +10,7 @@ app = Flask(__name__)
 CLIENT_ID = os.environ.get("CLIENT_ID", "236875")
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "b1816d956db3f38e72611d7c79a63e575a033698")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "strava_fixer_token")
+TOKEN_FILE = "/data/tokens.json"
 
 token_store = {
     "access_token": os.environ.get("ACCESS_TOKEN", ""),
@@ -16,6 +18,34 @@ token_store = {
     "expires_at": 0
 }
 token_lock = threading.Lock()
+
+
+def load_tokens():
+    try:
+        with open(TOKEN_FILE) as f:
+            data = json.load(f)
+        token_store["access_token"] = data["access_token"]
+        token_store["refresh_token"] = data["refresh_token"]
+        token_store["expires_at"] = data["expires_at"]
+        print("Loaded tokens from file.", flush=True)
+    except FileNotFoundError:
+        print("No token file found, using env vars.", flush=True)
+    except Exception as e:
+        print(f"Failed to load token file: {e}, using env vars.", flush=True)
+
+
+def save_tokens():
+    try:
+        os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+        with open(TOKEN_FILE, "w") as f:
+            json.dump({
+                "access_token": token_store["access_token"],
+                "refresh_token": token_store["refresh_token"],
+                "expires_at": token_store["expires_at"]
+            }, f)
+        print("Tokens saved to file.", flush=True)
+    except Exception as e:
+        print(f"Failed to save tokens: {e}", flush=True)
 
 
 def get_access_token():
@@ -36,6 +66,7 @@ def get_access_token():
         token_store["access_token"] = data["access_token"]
         token_store["refresh_token"] = data["refresh_token"]
         token_store["expires_at"] = data["expires_at"]
+        save_tokens()
         return token_store["access_token"]
 
 
@@ -110,6 +141,9 @@ def fix_distance(activity_id):
             print(f"Activity {activity_id} error (attempt {attempt}/{max_retries}): {e}", flush=True)
             if attempt < max_retries:
                 time.sleep(retry_interval)
+
+
+load_tokens()
 
 
 @app.route("/webhook", methods=["GET"])
