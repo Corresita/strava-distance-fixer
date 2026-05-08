@@ -11,6 +11,7 @@ CLIENT_ID = os.environ.get("CLIENT_ID", "236875")
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "b1816d956db3f38e72611d7c79a63e575a033698")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "strava_fixer_token")
 TOKEN_FILE = "/tmp/tokens.json"
+RAILWAY_API_URL = "https://backboard.railway.app/graphql/v2"
 
 token_store = {
     "access_token": os.environ.get("ACCESS_TOKEN", ""),
@@ -48,6 +49,46 @@ def save_tokens():
         print(f"Failed to save tokens: {e}", flush=True)
 
 
+def update_railway_vars():
+    api_token = os.environ.get("RAILWAY_API_TOKEN", "")
+    if not api_token:
+        return
+    project_id = os.environ.get("RAILWAY_PROJECT_ID", "")
+    service_id = os.environ.get("RAILWAY_SERVICE_ID", "")
+    environment_id = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
+    if not all([project_id, service_id, environment_id]):
+        print("Railway IDs not found, skipping var update.", flush=True)
+        return
+    try:
+        resp = requests.post(
+            RAILWAY_API_URL,
+            headers={"Authorization": f"Bearer {api_token}"},
+            json={
+                "query": "mutation V($i: VariableCollectionUpsertInput!) { variableCollectionUpsert(input: $i) }",
+                "variables": {
+                    "i": {
+                        "projectId": project_id,
+                        "serviceId": service_id,
+                        "environmentId": environment_id,
+                        "variables": {
+                            "ACCESS_TOKEN": token_store["access_token"],
+                            "REFRESH_TOKEN": token_store["refresh_token"],
+                            "EXPIRES_AT": str(token_store["expires_at"])
+                        }
+                    }
+                }
+            },
+            timeout=10
+        )
+        result = resp.json()
+        if "errors" in result:
+            print(f"Railway var update failed: {result['errors']}", flush=True)
+        else:
+            print("Railway env vars updated automatically.", flush=True)
+    except Exception as e:
+        print(f"Railway var update error: {e}", flush=True)
+
+
 def get_access_token():
     with token_lock:
         if time.time() < token_store["expires_at"] - 60:
@@ -67,6 +108,7 @@ def get_access_token():
         token_store["refresh_token"] = data["refresh_token"]
         token_store["expires_at"] = data["expires_at"]
         save_tokens()
+        update_railway_vars()
         return token_store["access_token"]
 
 
