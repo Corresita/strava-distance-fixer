@@ -13,7 +13,7 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "strava_fixer_token")
 token_store = {
     "access_token": os.environ.get("ACCESS_TOKEN", ""),
     "refresh_token": os.environ.get("REFRESH_TOKEN", ""),
-    "expires_at": 9999999999
+    "expires_at": 0
 }
 token_lock = threading.Lock()
 
