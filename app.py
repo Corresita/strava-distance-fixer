@@ -173,11 +173,32 @@ def fix_distance(activity_id):
                 json={"distance": new_m},
                 timeout=10
             )
-            if resp.status_code == 200:
-                print(f"Updated successfully: {rounded_km} km", flush=True)
-            else:
+            if resp.status_code != 200:
                 print(f"Update failed: {resp.status_code} {resp.text}", flush=True)
-            return
+                return
+
+            # verify the update actually stuck
+            time.sleep(5)
+            verify = requests.get(
+                f"https://www.strava.com/api/v3/activities/{activity_id}",
+                headers=headers,
+                timeout=10
+            )
+            if verify.status_code == 200:
+                actual_m = verify.json().get("distance", 0)
+                if abs(actual_m - new_m) < 0.01:
+                    print(f"Updated successfully: {rounded_km} km", flush=True)
+                    return
+                else:
+                    print(f"Strava reverted distance to {actual_m/1000:.4f} km, will retry...", flush=True)
+                    if attempt < max_retries:
+                        time.sleep(60)
+                        continue
+                    print(f"Activity {activity_id}: gave up after {max_retries} attempts, Strava keeps reverting.", flush=True)
+                    return
+            else:
+                print(f"Updated successfully (unverified): {rounded_km} km", flush=True)
+                return
 
         except Exception as e:
             print(f"Activity {activity_id} error (attempt {attempt}/{max_retries}): {e}", flush=True)
