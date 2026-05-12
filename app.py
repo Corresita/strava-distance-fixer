@@ -114,7 +114,7 @@ def get_access_token():
 
 def fix_distance(activity_id):
     print(f"Activity {activity_id}: thread started", flush=True)
-    time.sleep(180)
+    time.sleep(120)
 
     max_retries = 5
     retry_interval = 30

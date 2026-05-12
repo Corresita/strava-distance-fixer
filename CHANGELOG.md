@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Changed
-- Increase initial wait from 30s to 180s before first distance fix attempt, to allow Strava to finish processing GPS data from Garmin sync before PUT (prevents Strava from reverting the distance)
+- Increase initial wait from 30s to 120s before first distance fix attempt, to allow Strava to finish processing GPS data from Garmin sync before PUT (prevents Strava from reverting the distance)
 
 ---
 
