@@ -3,6 +3,7 @@ import json
 import time
 import threading
 import requests
+from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -19,6 +20,9 @@ token_store = {
     "expires_at": int(os.environ.get("EXPIRES_AT", "0"))
 }
 token_lock = threading.Lock()
+
+web_session = None
+web_session_lock = threading.Lock()
 
 
 def load_tokens():
@@ -112,14 +116,112 @@ def get_access_token():
         return token_store["access_token"]
 
 
+def get_web_session():
+    global web_session
+    with web_session_lock:
+        email = os.environ.get("STRAVA_EMAIL", "")
+        password = os.environ.get("STRAVA_PASSWORD", "")
+        if not email or not password:
+            raise Exception("STRAVA_EMAIL and STRAVA_PASSWORD not set in env vars")
+
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/124.0.0.0 Safari/537.36"
+        })
+
+        resp = session.get("https://www.strava.com/login", timeout=15)
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        token_tag = soup.find("meta", {"name": "csrf-token"})
+        if token_tag:
+            csrf = token_tag["content"]
+        else:
+            token_input = soup.find("input", {"name": "authenticity_token"})
+            csrf = token_input["value"] if token_input else ""
+
+        resp = session.post(
+            "https://www.strava.com/session",
+            data={
+                "email": email,
+                "password": password,
+                "authenticity_token": csrf,
+                "plan": ""
+            },
+            timeout=15,
+            allow_redirects=True
+        )
+
+        if "dashboard" not in resp.url and "/login" in resp.url:
+            raise Exception("Strava web login failed — check STRAVA_EMAIL and STRAVA_PASSWORD")
+
+        print("Strava web login successful.", flush=True)
+        web_session = session
+        return session
+
+
+def fix_distance_web(activity_id, new_m):
+    rounded_km = new_m / 1000
+    print(f"Activity {activity_id}: trying web form approach ({rounded_km} km)", flush=True)
+
+    session = get_web_session()
+
+    resp = session.get(
+        f"https://www.strava.com/activities/{activity_id}/edit",
+        timeout=15
+    )
+    if resp.status_code != 200:
+        raise Exception(f"Could not load edit page: {resp.status_code}")
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    form = soup.find("form", {"id": "edit-activity"}) or soup.find("form")
+    if not form:
+        raise Exception("Edit form not found on page")
+
+    data = {}
+    for inp in form.find_all("input"):
+        name = inp.get("name")
+        value = inp.get("value", "")
+        if name:
+            data[name] = value
+    for sel in form.find_all("select"):
+        name = sel.get("name")
+        selected = sel.find("option", {"selected": True})
+        if name and selected:
+            data[name] = selected.get("value", "")
+    for textarea in form.find_all("textarea"):
+        name = textarea.get("name")
+        if name:
+            data[name] = textarea.string or ""
+
+    distance_key = next((k for k in data if "distance" in k.lower()), None)
+    if not distance_key:
+        raise Exception(f"Distance field not found in form. Fields: {list(data.keys())}")
+
+    data[distance_key] = str(rounded_km)
+    data["_method"] = "put"
+
+    action = form.get("action", f"/activities/{activity_id}")
+    url = f"https://www.strava.com{action}" if not action.startswith("http") else action
+
+    resp = session.post(url, data=data, timeout=15, allow_redirects=True)
+    if resp.status_code not in (200, 302):
+        raise Exception(f"Form submission failed: {resp.status_code}")
+
+    print(f"Activity {activity_id}: web form submitted successfully.", flush=True)
+    return True
+
+
 def fix_distance(activity_id, initial_wait=120):
     print(f"Activity {activity_id}: thread started", flush=True)
     if initial_wait > 0:
         time.sleep(initial_wait)
 
-    max_retries = 8
+    max_retries = 5
     retry_interval = 60
     prev_distance = None
+    api_reverted_count = 0
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -167,7 +269,13 @@ def fix_distance(activity_id, initial_wait=120):
                 print("Already correct, no update needed.", flush=True)
                 return
 
-            # wait for GPS processing to stabilize before PUT
+            # if API was reverted twice already, switch to web form
+            if api_reverted_count >= 2:
+                print(f"Activity {activity_id}: API reverted {api_reverted_count}x, switching to web form.", flush=True)
+                fix_distance_web(activity_id, new_m)
+                return
+
+            # wait for GPS distance to stabilize before PUT
             if prev_distance is not None and abs(original_m - prev_distance) > 0.01:
                 print(f"Activity {activity_id}: distance still changing "
                       f"({prev_distance/1000:.4f} -> {original_km:.4f} km), waiting...", flush=True)
@@ -189,8 +297,7 @@ def fix_distance(activity_id, initial_wait=120):
                 print(f"Update failed: {resp.status_code} {resp.text}", flush=True)
                 return
 
-            # verify the update actually stuck
-            time.sleep(60)
+            time.sleep(30)
             verify = requests.get(
                 f"https://www.strava.com/api/v3/activities/{activity_id}",
                 headers=headers,
@@ -199,15 +306,18 @@ def fix_distance(activity_id, initial_wait=120):
             if verify.status_code == 200:
                 actual_m = verify.json().get("distance", 0)
                 if abs(actual_m - new_m) < 0.01:
-                    print(f"Updated successfully: {rounded_km} km", flush=True)
+                    print(f"Updated successfully via API: {rounded_km} km", flush=True)
                     return
                 else:
-                    print(f"Strava reverted distance to {actual_m/1000:.4f} km, will retry...", flush=True)
+                    api_reverted_count += 1
+                    print(f"Strava reverted distance to {actual_m/1000:.4f} km "
+                          f"(revert #{api_reverted_count}), will retry...", flush=True)
                     prev_distance = actual_m
                     if attempt < max_retries:
                         time.sleep(retry_interval)
                         continue
-                    print(f"Activity {activity_id}: gave up after {max_retries} attempts, Strava keeps reverting.", flush=True)
+                    # last attempt: try web form
+                    fix_distance_web(activity_id, new_m)
                     return
             else:
                 print(f"Updated successfully (unverified): {rounded_km} km", flush=True)

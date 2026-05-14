@@ -4,11 +4,13 @@
 
 ### Added
 - `/fix/<activity_id>` endpoint for manually triggering distance fix on a specific activity (skips initial wait, useful for debugging and fixing past activities)
+- Web form fallback: if Strava API reverts the distance 2+ times (GPS activity protection), automatically switch to simulating Strava web edit form via `requests` + BeautifulSoup, which bypasses the GPS protection
+- `STRAVA_EMAIL` and `STRAVA_PASSWORD` env vars required for web form fallback
 
 ### Changed
 - Wait for GPS distance to stabilize before PUT: if distance changed since last attempt, wait another 60s before trying
-- Increase verify wait from 5s to 60s after PUT to give Strava time to finalize
-- Increase retry interval from 30s to 60s, max retries from 5 to 8
+- Verify wait reduced back to 30s (60s was unnecessary)
+- Max retries reduced back to 5 (web form fallback handles persistent reverts)
 
 ---
 
