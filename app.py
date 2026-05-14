@@ -8,8 +8,8 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-CLIENT_ID = os.environ.get("CLIENT_ID", "236875")
-CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "b1816d956db3f38e72611d7c79a63e575a033698")
+CLIENT_ID = os.environ.get("CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "strava_fixer_token")
 TOKEN_FILE = "/tmp/tokens.json"
 RAILWAY_API_URL = "https://backboard.railway.app/graphql/v2"
