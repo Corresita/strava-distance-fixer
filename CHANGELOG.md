@@ -5,6 +5,11 @@
 ### Added
 - `/fix/<activity_id>` endpoint for manually triggering distance fix on a specific activity (skips initial wait, useful for debugging and fixing past activities)
 
+### Changed
+- Wait for GPS distance to stabilize before PUT: if distance changed since last attempt, wait another 60s before trying
+- Increase verify wait from 5s to 60s after PUT to give Strava time to finalize
+- Increase retry interval from 30s to 60s, max retries from 5 to 8
+
 ---
 
 ## [1.4.0] - 2026-05-10

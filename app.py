@@ -117,8 +117,9 @@ def fix_distance(activity_id, initial_wait=120):
     if initial_wait > 0:
         time.sleep(initial_wait)
 
-    max_retries = 5
-    retry_interval = 30
+    max_retries = 8
+    retry_interval = 60
+    prev_distance = None
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -162,11 +163,21 @@ def fix_distance(activity_id, initial_wait=120):
             rounded_km = float(f"{n}.{n:02d}")
             new_m = rounded_km * 1000
 
-            print(f"Activity {activity_id}: {original_km:.4f} km -> {rounded_km} km", flush=True)
-
             if abs(new_m - original_m) < 0.01:
                 print("Already correct, no update needed.", flush=True)
                 return
+
+            # wait for GPS processing to stabilize before PUT
+            if prev_distance is not None and abs(original_m - prev_distance) > 0.01:
+                print(f"Activity {activity_id}: distance still changing "
+                      f"({prev_distance/1000:.4f} -> {original_km:.4f} km), waiting...", flush=True)
+                prev_distance = original_m
+                if attempt < max_retries:
+                    time.sleep(retry_interval)
+                    continue
+            prev_distance = original_m
+
+            print(f"Activity {activity_id}: {original_km:.4f} km -> {rounded_km} km", flush=True)
 
             resp = requests.put(
                 f"https://www.strava.com/api/v3/activities/{activity_id}",
@@ -179,7 +190,7 @@ def fix_distance(activity_id, initial_wait=120):
                 return
 
             # verify the update actually stuck
-            time.sleep(5)
+            time.sleep(60)
             verify = requests.get(
                 f"https://www.strava.com/api/v3/activities/{activity_id}",
                 headers=headers,
@@ -192,8 +203,9 @@ def fix_distance(activity_id, initial_wait=120):
                     return
                 else:
                     print(f"Strava reverted distance to {actual_m/1000:.4f} km, will retry...", flush=True)
+                    prev_distance = actual_m
                     if attempt < max_retries:
-                        time.sleep(60)
+                        time.sleep(retry_interval)
                         continue
                     print(f"Activity {activity_id}: gave up after {max_retries} attempts, Strava keeps reverting.", flush=True)
                     return
