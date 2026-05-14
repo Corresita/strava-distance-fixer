@@ -2,8 +2,8 @@
 
 ## [Unreleased]
 
-### Changed
-- Increase initial wait from 30s to 120s before first distance fix attempt, to allow Strava to finish processing GPS data from Garmin sync before PUT (prevents Strava from reverting the distance)
+### Added
+- `/fix/<activity_id>` endpoint for manually triggering distance fix on a specific activity (skips initial wait, useful for debugging and fixing past activities)
 
 ---
 

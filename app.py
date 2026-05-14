@@ -112,9 +112,10 @@ def get_access_token():
         return token_store["access_token"]
 
 
-def fix_distance(activity_id):
+def fix_distance(activity_id, initial_wait=120):
     print(f"Activity {activity_id}: thread started", flush=True)
-    time.sleep(120)
+    if initial_wait > 0:
+        time.sleep(initial_wait)
 
     max_retries = 5
     retry_interval = 30
@@ -228,6 +229,13 @@ def webhook_receive():
         t = threading.Thread(target=fix_distance, args=(activity_id,))
         t.start()
     return "OK", 200
+
+
+@app.route("/fix/<int:activity_id>", methods=["GET"])
+def manual_fix(activity_id):
+    t = threading.Thread(target=fix_distance, args=(activity_id,), kwargs={"initial_wait": 0})
+    t.start()
+    return f"Started fix for activity {activity_id}, check Railway logs.", 200
 
 
 @app.route("/", methods=["GET"])
