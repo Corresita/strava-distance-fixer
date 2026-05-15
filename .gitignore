@@ -6,3 +6,11 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+
+# Local state
+garmin_tokens/
+history.json
+sync.log
+sample_*.tcx
+sample_*.fit
+sample_*.zip

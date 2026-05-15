@@ -1,23 +1,36 @@
 # Changelog
 
-## [Unreleased]
+## [2.0.0] - 2026-05-15
+
+Rewrite. The "modify Strava activity after upload" approach proved fundamentally unworkable — Strava's `UpdatableActivity` schema has no `distance` field, and the web edit form for GPS activities lost its distance input around 2024. The webhook-and-fallback architecture was abandoned.
+
+The replacement is a local command-line tool that intercepts the data path **before** Strava sees it: pull the activity from Garmin Connect, scale the GPS track itself, upload the modified TCX to Strava as a fresh activity.
 
 ### Added
-- `.gitignore` + `.env.example` template; `.env` for local dev secrets is gitignored
-- `/fix/<activity_id>` endpoint for manually triggering distance fix on a specific activity (skips initial wait, useful for debugging and fixing past activities)
-- Web form fallback: if Strava API reverts the distance 2+ times (GPS activity protection), automatically switch to simulating Strava web edit form via `requests` + BeautifulSoup, which bypasses the GPS protection
-- `STRAVA_SESSION_COOKIE` env var required for web form fallback (replaces STRAVA_EMAIL/STRAVA_PASSWORD so accounts with 2FA still work)
-- Auto-rotate Strava session cookie: after each request, capture the latest `_strava4_session` from Strava's response, persist to `/tmp/strava_cookie.json`, and push to Railway env vars. As long as the app is active, the cookie should never expire.
-- GPS activity early-routing: after the initial GET, check `manual` and `start_latlng` — if it's a GPS activity, skip the API PUT loop entirely and go straight to the web form. Saves ~150s and 4 wasted requests per GPS activity. Manual activities (no GPS source) still use API since it persists for them.
-- Web form fallback hardening (three fixes that prevent silent failures):
-  - Unit conversion: read `measurement_preference` via `GET /api/v3/athlete`; if user is on imperial, convert km → miles before submitting (previously submitted km value into miles-labeled field, writing 1.609× the intended distance)
-  - CSRF token in `X-CSRF-Token` header (pulled fresh from edit page `<meta>` tag), not just in form body — required by Rails/Turbo
-  - Post-submit verification: sleep 5s, re-GET via API, compare distance with 2 m tolerance; raise if not persisted (previously a 200/302 response was treated as success even if Strava silently dropped the change)
+- `sync.py` — single entry point, processes the latest Garmin running activity (or one by ID) in ~30 seconds
+- `garmin_client.py` — Garmin Connect login with cached OAuth1 token (good for ~1 year, MFA only on first run)
+- `tcx_scaler.py` — uniform GPS-path scaling anchored at the first trackpoint; scales lat/lng, per-trackpoint distance and speed, lap distances. Times / HR / cadence / power / altitude untouched.
+- `strava_uploader.py` — Strava OAuth refresh, multipart upload, processing-status poll
+- `reauth_strava.py` — local-callback OAuth helper for one-shot token rotation
+- `history.json` — per-run audit trail; `sync.log` — append-only log
+- TCX scaling falls back to uploading the unmodified file on failure, so the activity always lands on Strava
 
-### Changed
-- Wait for GPS distance to stabilize before PUT: if distance changed since last attempt, wait another 60s before trying
-- Verify wait reduced back to 30s (60s was unnecessary)
-- Max retries reduced back to 5 (web form fallback handles persistent reverts)
+### Removed
+- Flask webhook server (`app.py`, `test_app.py`)
+- Railway deployment config (`Procfile`)
+- Web form simulation, session cookie management, CSRF handling — all dead ends with Strava's current GPS-activity policy
+- `STRAVA_SESSION_COOKIE`, `RAILWAY_*` env vars
+
+### Operational note
+Keep Garmin Connect → Strava direct sync **enabled**. The script waits for that auto-synced copy to appear on Strava, deletes it, then uploads the scaled version. This keeps non-running activities (cycling, strength, swims) flowing untouched through the original auto-sync, while runs get the `N.NN` treatment.
+
+If the scaled upload fails the script falls back to uploading the original (un-scaled) TCX, so a run never disappears from Strava — at worst its distance is unmodified.
+
+---
+
+## [1.x] (deprecated, see git history)
+
+The 1.x series was a Flask webhook server that tried to rewrite Strava distances after upload. It worked only for manually-entered activities; GPS activities were silently reverted by Strava's stream-recomputation. Replaced wholesale in 2.0.
 
 ---
 
