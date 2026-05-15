@@ -12,6 +12,7 @@ CLIENT_ID = os.environ.get("CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "strava_fixer_token")
 TOKEN_FILE = "/tmp/tokens.json"
+COOKIE_FILE = "/tmp/strava_cookie.json"
 RAILWAY_API_URL = "https://backboard.railway.app/graphql/v2"
 
 token_store = {
@@ -21,6 +22,7 @@ token_store = {
 }
 token_lock = threading.Lock()
 
+cookie_store = {"value": os.environ.get("STRAVA_SESSION_COOKIE", "")}
 web_session = None
 web_session_lock = threading.Lock()
 
@@ -53,7 +55,7 @@ def save_tokens():
         print(f"Failed to save tokens: {e}", flush=True)
 
 
-def update_railway_vars():
+def update_railway_vars(variables):
     api_token = os.environ.get("RAILWAY_API_TOKEN", "")
     if not api_token:
         return
@@ -74,11 +76,7 @@ def update_railway_vars():
                         "projectId": project_id,
                         "serviceId": service_id,
                         "environmentId": environment_id,
-                        "variables": {
-                            "ACCESS_TOKEN": token_store["access_token"],
-                            "REFRESH_TOKEN": token_store["refresh_token"],
-                            "EXPIRES_AT": str(token_store["expires_at"])
-                        }
+                        "variables": variables
                     }
                 }
             },
@@ -88,9 +86,34 @@ def update_railway_vars():
         if "errors" in result:
             print(f"Railway var update failed: {result['errors']}", flush=True)
         else:
-            print("Railway env vars updated automatically.", flush=True)
+            print(f"Railway env vars updated: {list(variables.keys())}", flush=True)
     except Exception as e:
         print(f"Railway var update error: {e}", flush=True)
+
+
+def load_cookie():
+    try:
+        with open(COOKIE_FILE) as f:
+            data = json.load(f)
+        cookie_store["value"] = data["value"]
+        print("Loaded Strava cookie from file.", flush=True)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"Failed to load cookie file: {e}", flush=True)
+
+
+def save_cookie(new_value):
+    if not new_value or new_value == cookie_store["value"]:
+        return
+    cookie_store["value"] = new_value
+    try:
+        with open(COOKIE_FILE, "w") as f:
+            json.dump({"value": new_value}, f)
+        print("Strava cookie rotated and saved.", flush=True)
+    except Exception as e:
+        print(f"Failed to save cookie file: {e}", flush=True)
+    update_railway_vars({"STRAVA_SESSION_COOKIE": new_value})
 
 
 def get_access_token():
@@ -112,14 +135,18 @@ def get_access_token():
         token_store["refresh_token"] = data["refresh_token"]
         token_store["expires_at"] = data["expires_at"]
         save_tokens()
-        update_railway_vars()
+        update_railway_vars({
+            "ACCESS_TOKEN": token_store["access_token"],
+            "REFRESH_TOKEN": token_store["refresh_token"],
+            "EXPIRES_AT": str(token_store["expires_at"])
+        })
         return token_store["access_token"]
 
 
 def get_web_session():
     global web_session
     with web_session_lock:
-        cookie_value = os.environ.get("STRAVA_SESSION_COOKIE", "")
+        cookie_value = cookie_store["value"]
         if not cookie_value:
             raise Exception("STRAVA_SESSION_COOKIE not set in env vars")
 
@@ -137,6 +164,11 @@ def get_web_session():
             raise Exception("Strava session cookie expired or invalid — refresh STRAVA_SESSION_COOKIE")
         if resp.status_code != 200:
             raise Exception(f"Strava session check failed: {resp.status_code}")
+
+        # Strava may rotate the session cookie on each request — persist any new value
+        new_cookie = session.cookies.get("_strava4_session", domain=".strava.com")
+        if new_cookie and new_cookie != cookie_value:
+            save_cookie(new_cookie)
 
         print("Strava session cookie valid.", flush=True)
         web_session = session
@@ -223,6 +255,11 @@ def fix_distance_web(activity_id, new_m):
     resp = session.post(url, data=data, timeout=15, allow_redirects=True)
     if resp.status_code not in (200, 302):
         raise Exception(f"Form submission failed: {resp.status_code}")
+
+    # rotate cookie if Strava issued a new one
+    new_cookie = session.cookies.get("_strava4_session", domain=".strava.com")
+    if new_cookie and new_cookie != cookie_store["value"]:
+        save_cookie(new_cookie)
 
     # Verify the change persisted: web form POST 2xx alone doesn't prove it worked.
     # Imperial round-trip can introduce ~1m of float drift, so use 2m tolerance.
@@ -376,6 +413,7 @@ def fix_distance(activity_id, initial_wait=120):
 
 
 load_tokens()
+load_cookie()
 
 
 @app.route("/webhook", methods=["GET"])

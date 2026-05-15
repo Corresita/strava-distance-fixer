@@ -7,6 +7,7 @@
 - `/fix/<activity_id>` endpoint for manually triggering distance fix on a specific activity (skips initial wait, useful for debugging and fixing past activities)
 - Web form fallback: if Strava API reverts the distance 2+ times (GPS activity protection), automatically switch to simulating Strava web edit form via `requests` + BeautifulSoup, which bypasses the GPS protection
 - `STRAVA_SESSION_COOKIE` env var required for web form fallback (replaces STRAVA_EMAIL/STRAVA_PASSWORD so accounts with 2FA still work)
+- Auto-rotate Strava session cookie: after each request, capture the latest `_strava4_session` from Strava's response, persist to `/tmp/strava_cookie.json`, and push to Railway env vars. As long as the app is active, the cookie should never expire.
 - GPS activity early-routing: after the initial GET, check `manual` and `start_latlng` — if it's a GPS activity, skip the API PUT loop entirely and go straight to the web form. Saves ~150s and 4 wasted requests per GPS activity. Manual activities (no GPS source) still use API since it persists for them.
 - Web form fallback hardening (three fixes that prevent silent failures):
   - Unit conversion: read `measurement_preference` via `GET /api/v3/athlete`; if user is on imperial, convert km → miles before submitting (previously submitted km value into miles-labeled field, writing 1.609× the intended distance)
