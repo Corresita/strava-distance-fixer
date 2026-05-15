@@ -1,6 +1,6 @@
 # Strava Distance Fixer
 
-A small Flask service that listens for Strava activity-created webhooks and rewrites each new activity's distance to a specific preference form `N.NN` km (e.g. `7.07 km`, `12.12 km`). Designed to run as a long-lived web service on Railway.
+A small Flask service that listens for Strava activity-created webhooks and rewrites each new activity's distance to a specific preferred repeating-digit form `N.NN` km (e.g. `7.07 km`, `12.12 km`). Designed to run as a long-lived web service on Railway.
 
 ## What it does
 
