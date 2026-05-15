@@ -116,7 +116,7 @@ def wait_for_garmin_sync_to_strava(
     return None
 
 
-def run(activity_id: int | None, force: bool, no_delete: bool) -> int:
+def run(activity_id: int | None, force: bool, no_delete: bool) -> dict:
     log.info("=" * 70)
     log.info(f"sync started  force={force}  activity_id={activity_id}  no_delete={no_delete}")
     ts_now = datetime.now().isoformat(timespec="seconds")
@@ -129,7 +129,7 @@ def run(activity_id: int | None, force: bool, no_delete: bool) -> int:
         activity = garmin_client.latest_running_activity(client)
         if activity is None:
             log.error("No recent GPS running activity found.")
-            return 1
+            return {"ok": False, "pipeline_path": "no_activity", "error": "no recent GPS running activity"}
         activity_id = activity["activityId"]
     else:
         activity = garmin_client.get_activity(client, activity_id)
@@ -144,18 +144,21 @@ def run(activity_id: int | None, force: bool, no_delete: bool) -> int:
 
     if not force and already_synced(activity_id):
         log.info("Already synced (use --force to redo). Done.")
-        append_history(HistoryEntry(
+        entry = HistoryEntry(
             ts=ts_now, garmin_activity_id=activity_id, garmin_name=garmin_name,
             original_km=original_km, target_km=0.0, pipeline_path="skipped_existing",
             scale_factor=None, strava_deleted_id=None, strava_new_id=None,
             fallback_reason=None, error=None,
-        ))
-        return 0
+        )
+        append_history(entry)
+        return {"ok": True, **asdict(entry), "strava_url": None}
 
     tgt_km = target_km(original_m)
     if tgt_km is None:
         log.info("Under 1 km, skipping.")
-        return 0
+        return {"ok": True, "pipeline_path": "skipped_short", "garmin_activity_id": activity_id,
+                "garmin_name": garmin_name, "original_km": original_km, "target_km": None,
+                "error": None}
     target_m = tgt_km * 1000
 
     log.info(f"Target: {tgt_km} km")
@@ -221,22 +224,26 @@ def run(activity_id: int | None, force: bool, no_delete: bool) -> int:
         new_id = result.activity_id if result else None
         error_msg = None if (result and new_id) else (result.error if result else "no upload attempt succeeded")
 
-        append_history(HistoryEntry(
+        entry = HistoryEntry(
             ts=ts_now, garmin_activity_id=activity_id, garmin_name=garmin_name,
             original_km=original_km, target_km=tgt_km, pipeline_path=pipeline_path,
             scale_factor=scale_factor, strava_deleted_id=deleted_id,
             strava_new_id=new_id, fallback_reason=fallback_reason, error=error_msg,
-        ))
+        )
+        append_history(entry)
+
+        strava_url = f"https://www.strava.com/activities/{new_id}" if new_id else None
+        ok = pipeline_path in ("scaled_uploaded", "fallback_original")
 
         if pipeline_path == "scaled_uploaded":
-            log.info(f"✓ DONE  scaled  https://www.strava.com/activities/{new_id}  ({tgt_km} km)")
-            return 0
-        if pipeline_path == "fallback_original":
-            log.warning(f"⚠ DONE  original-fallback  https://www.strava.com/activities/{new_id}  "
+            log.info(f"✓ DONE  scaled  {strava_url}  ({tgt_km} km)")
+        elif pipeline_path == "fallback_original":
+            log.warning(f"⚠ DONE  original-fallback  {strava_url}  "
                         f"(distance NOT modified: {original_km:.2f} km)")
-            return 0
-        log.error(f"✗ FAILED  {error_msg}")
-        return 2
+        else:
+            log.error(f"✗ FAILED  {error_msg}")
+
+        return {"ok": ok, **asdict(entry), "strava_url": strava_url}
 
 
 def main() -> int:
@@ -248,7 +255,8 @@ def main() -> int:
     p.add_argument("--no-delete", action="store_true",
                    help="don't search for / delete the Strava auto-synced copy")
     args = p.parse_args()
-    return run(args.activity_id, args.force, args.no_delete)
+    result = run(args.activity_id, args.force, args.no_delete)
+    return 0 if result.get("ok") else 2
 
 
 if __name__ == "__main__":
