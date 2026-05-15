@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- `.gitignore` + `.env.example` template; `.env` for local dev secrets is gitignored
 - `/fix/<activity_id>` endpoint for manually triggering distance fix on a specific activity (skips initial wait, useful for debugging and fixing past activities)
 - Web form fallback: if Strava API reverts the distance 2+ times (GPS activity protection), automatically switch to simulating Strava web edit form via `requests` + BeautifulSoup, which bypasses the GPS protection
 - `STRAVA_EMAIL` and `STRAVA_PASSWORD` env vars required for web form fallback
