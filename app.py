@@ -161,9 +161,35 @@ def get_web_session():
         return session
 
 
+def get_measurement_preference(token):
+    """Return 'feet' (imperial) or 'meters' (metric). Defaults to 'meters' on failure."""
+    try:
+        resp = requests.get(
+            "https://www.strava.com/api/v3/athlete",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            return resp.json().get("measurement_preference", "meters")
+    except Exception as e:
+        print(f"Failed to fetch measurement_preference: {e}, assuming metric.", flush=True)
+    return "meters"
+
+
 def fix_distance_web(activity_id, new_m):
     rounded_km = new_m / 1000
-    print(f"Activity {activity_id}: trying web form approach ({rounded_km} km)", flush=True)
+
+    # Strava's edit form displays distance in the user's preferred unit.
+    # If imperial, submitting a km-valued string would be parsed as miles and write 1.609x the intended distance.
+    token = get_access_token()
+    unit_pref = get_measurement_preference(token)
+    if unit_pref == "feet":
+        display_value = f"{rounded_km / 1.609344:.4f}"  # km -> miles, 4 decimals keeps round-trip within ~1m
+        print(f"Activity {activity_id}: web form approach, imperial units → {display_value} mi "
+              f"(target {rounded_km} km)", flush=True)
+    else:
+        display_value = f"{rounded_km:.2f}"
+        print(f"Activity {activity_id}: web form approach → {display_value} km", flush=True)
 
     session = get_web_session()
 
@@ -175,6 +201,13 @@ def fix_distance_web(activity_id, new_m):
         raise Exception(f"Could not load edit page: {resp.status_code}")
 
     soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Modern Strava (Rails/Turbo) requires CSRF in the X-CSRF-Token header,
+    # not just the form hidden field. Pull a fresh token from this edit page.
+    csrf_meta = soup.find("meta", {"name": "csrf-token"})
+    if csrf_meta and csrf_meta.get("content"):
+        session.headers["X-CSRF-Token"] = csrf_meta["content"]
+
     form = soup.find("form", {"id": "edit-activity"}) or soup.find("form")
     if not form:
         raise Exception("Edit form not found on page")
@@ -199,7 +232,7 @@ def fix_distance_web(activity_id, new_m):
     if not distance_key:
         raise Exception(f"Distance field not found in form. Fields: {list(data.keys())}")
 
-    data[distance_key] = str(rounded_km)
+    data[distance_key] = display_value
     data["_method"] = "put"
 
     action = form.get("action", f"/activities/{activity_id}")
@@ -209,7 +242,24 @@ def fix_distance_web(activity_id, new_m):
     if resp.status_code not in (200, 302):
         raise Exception(f"Form submission failed: {resp.status_code}")
 
-    print(f"Activity {activity_id}: web form submitted successfully.", flush=True)
+    # Verify the change persisted: web form POST 2xx alone doesn't prove it worked.
+    # Imperial round-trip can introduce ~1m of float drift, so use 2m tolerance.
+    time.sleep(5)
+    verify = requests.get(
+        f"https://www.strava.com/api/v3/activities/{activity_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10
+    )
+    if verify.status_code == 200:
+        actual_m = verify.json().get("distance", 0)
+        if abs(actual_m - new_m) < 2.0:
+            print(f"Activity {activity_id}: web form persisted ({actual_m/1000:.4f} km)", flush=True)
+            return True
+        raise Exception(
+            f"Web form submitted but distance not persisted: "
+            f"target {new_m/1000:.4f} km, actual {actual_m/1000:.4f} km"
+        )
+    print(f"Activity {activity_id}: web form submitted (verify GET failed: {verify.status_code})", flush=True)
     return True
 
 
@@ -267,6 +317,20 @@ def fix_distance(activity_id, initial_wait=120):
 
             if abs(new_m - original_m) < 0.01:
                 print("Already correct, no update needed.", flush=True)
+                return
+
+            # GPS activities: API PUT will be silently reverted, route directly to web form.
+            # Why: UpdatableActivity model has no `distance` field, so the server async-recomputes
+            # from GPS streams. Manual activities (no GPS source) are the only case API can persist.
+            is_manual = bool(activity.get("manual", False))
+            has_gps = bool(activity.get("start_latlng"))
+            if not is_manual and has_gps:
+                print(f"Activity {activity_id}: GPS-recorded, routing directly to web form "
+                      f"({original_km:.4f} km -> {rounded_km} km)", flush=True)
+                try:
+                    fix_distance_web(activity_id, new_m)
+                except Exception as e:
+                    print(f"Activity {activity_id}: web form fallback failed: {e}", flush=True)
                 return
 
             # if API was reverted twice already, switch to web form
