@@ -119,10 +119,9 @@ def get_access_token():
 def get_web_session():
     global web_session
     with web_session_lock:
-        email = os.environ.get("STRAVA_EMAIL", "")
-        password = os.environ.get("STRAVA_PASSWORD", "")
-        if not email or not password:
-            raise Exception("STRAVA_EMAIL and STRAVA_PASSWORD not set in env vars")
+        cookie_value = os.environ.get("STRAVA_SESSION_COOKIE", "")
+        if not cookie_value:
+            raise Exception("STRAVA_SESSION_COOKIE not set in env vars")
 
         session = requests.Session()
         session.headers.update({
@@ -130,33 +129,16 @@ def get_web_session():
                           "AppleWebKit/537.36 (KHTML, like Gecko) "
                           "Chrome/124.0.0.0 Safari/537.36"
         })
+        session.cookies.set("_strava4_session", cookie_value, domain=".strava.com")
 
-        resp = session.get("https://www.strava.com/login", timeout=15)
-        soup = BeautifulSoup(resp.text, "html.parser")
+        # verify session is valid by hitting dashboard
+        resp = session.get("https://www.strava.com/dashboard", timeout=15, allow_redirects=False)
+        if resp.status_code in (301, 302) and "/login" in resp.headers.get("Location", ""):
+            raise Exception("Strava session cookie expired or invalid — refresh STRAVA_SESSION_COOKIE")
+        if resp.status_code != 200:
+            raise Exception(f"Strava session check failed: {resp.status_code}")
 
-        token_tag = soup.find("meta", {"name": "csrf-token"})
-        if token_tag:
-            csrf = token_tag["content"]
-        else:
-            token_input = soup.find("input", {"name": "authenticity_token"})
-            csrf = token_input["value"] if token_input else ""
-
-        resp = session.post(
-            "https://www.strava.com/session",
-            data={
-                "email": email,
-                "password": password,
-                "authenticity_token": csrf,
-                "plan": ""
-            },
-            timeout=15,
-            allow_redirects=True
-        )
-
-        if "dashboard" not in resp.url and "/login" in resp.url:
-            raise Exception("Strava web login failed — check STRAVA_EMAIL and STRAVA_PASSWORD")
-
-        print("Strava web login successful.", flush=True)
+        print("Strava session cookie valid.", flush=True)
         web_session = session
         return session
 
