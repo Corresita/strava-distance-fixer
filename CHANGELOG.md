@@ -1,5 +1,29 @@
 # Changelog
 
+## [2.1.0] - 2026-05-16
+
+Add HTTP wrapper so the sync can be triggered remotely from an iOS Shortcut — the original `python sync.py` CLI still works locally, but a Flask server (`sync_server.py`) exposes the same pipeline at `POST /sync` for phone-based invocation. Designed for Railway deployment.
+
+### Added
+- `sync_server.py` — Flask wrapper around `sync.run()`, gated by `X-Sync-Secret` header, bootstraps Garmin OAuth token from `GARMIN_TOKEN_B64` env var on startup so fresh containers don't trigger rate-limited SSO logins
+- `Procfile` + `railway.toml` — gunicorn entrypoint for Railway (Railpack builder)
+- `flask`, `gunicorn` back in `requirements.txt`
+- `?no_delete=1` URL parameter on `/sync` to skip the Strava find-and-delete step
+- Debug logging in `find_activity_near`: search window, candidate count, per-activity distance diff, final match decision
+- Debug logging in `delete_activity`: token prefix, explicit `flush=True` to defeat gunicorn stdout buffering
+- Browser-style `User-Agent` header on all Strava requests (attempt to work around suspected cloud-IP throttling)
+- `_persist_env` now patches `os.environ` even when `.env` is absent (Railway has no `.env` file, only platform env vars) — avoids re-refreshing the Strava access token on every single API call
+
+### Discovered (the wall this version hit)
+End-to-end pipeline runs correctly on Railway, but Strava's `DELETE /activities/{id}` returns **`401 "Application internal invalid"`** for this OAuth app — for **any** real activity, from **any** origin (local laptop or Railway), regardless of User-Agent. Same token at the same instant can `PUT` the activity (200) and `DELETE` a nonexistent ID (404 — proving generic delete permission exists), but cannot `DELETE` a real activity. Strava appears to have restricted DELETE on apps in the default "Limited Access" tier.
+
+Net effect for v2.1: the delete-and-reupload pipeline cannot complete. The script logs the failure, falls back to uploading the unmodified TCX, which then also dedup-fails against the original auto-synced copy. See `docs/journey.md` Approach 6 for the full diagnostic trail.
+
+### Operational note
+Until the DELETE block is worked around (Strava app tier upgrade, or a different attack vector — see journey.md), the current state on Railway is **non-functional for GPS runs**. Running locally with `python sync.py` has the same DELETE failure. The pipeline only fully works in test scenarios where no Strava auto-synced copy exists (e.g., the time-shifted upload test from 2.0.0 validation).
+
+---
+
 ## [2.0.0] - 2026-05-15
 
 Rewrite. The "modify Strava activity after upload" approach proved fundamentally unworkable — Strava's `UpdatableActivity` schema has no `distance` field, and the web edit form for GPS activities lost its distance input around 2024. The webhook-and-fallback architecture was abandoned.

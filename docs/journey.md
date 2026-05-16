@@ -61,12 +61,122 @@ We almost went with python-garminconnect anyway, but the rate-limit risk for a p
 
 End-to-end takes ~30 seconds per run. The entire 19.200 km → 19.19 km change is a 0.05 % geometric shrink — invisible on the map, exact on the dashboard.
 
+**Tested end-to-end on 2026-05-14**: 19.200 km Garmin activity → scaled TCX uploaded with shifted timestamps (to bypass Strava's dedup against the auto-synced original) → resulting Strava activity 18512945963 reported `distance: 19190.00 m` and preserved all 14,522 HR samples, cadence, power, altitude. The scaling math works perfectly. The pipeline works perfectly on a "clean" upload (no existing Strava copy).
+
+## Approach 6: Remote trigger via iOS Shortcut → Railway → sync.py (v2.1, attempted 2026-05-16)
+
+**Goal.** Make Approach 5 phone-triggered instead of laptop-required. Wrap `sync.run()` in a Flask endpoint, deploy on Railway, call it from an iOS Shortcut. Same pipeline, but reachable from anywhere.
+
+**What we built.** `sync_server.py` with `POST /sync` gated by an `X-Sync-Secret` header. Garmin OAuth1 token loaded from a `GARMIN_TOKEN_B64` env var on startup so containers never SSO. iOS Shortcut sends `POST` with the secret, reads `strava_url` from the JSON response, shows it in a notification.
+
+**Where it broke.** The pipeline depends on a "find Strava's auto-synced copy of the Garmin activity, DELETE it, upload our scaled version" step. The DELETE call returns:
+
+```
+401 {"message":"Authorization Error",
+     "errors":[{"resource":"Application","field":"internal","code":"invalid"}]}
+```
+
+**Diagnostic trail (all with the same token, same scopes — `read activity:read_all activity:write`):**
+
+| Test                                                | Result                |
+| --------------------------------------------------- | --------------------- |
+| `GET /api/v3/athlete`                               | 200 ✓                 |
+| `GET /api/v3/activities/{id}`                       | 200 ✓                 |
+| `PUT /api/v3/activities/{id}` (changing description)| 200 ✓                 |
+| `POST /api/v3/uploads`                              | 200, then dedup error |
+| `DELETE /api/v3/activities/99999999999` (fake id)   | **404 "Record Not Found"** — proves DELETE permission exists at app level |
+| `DELETE /api/v3/activities/{real id}`               | **401 "Application internal invalid"** |
+
+The 401 is **not** about IP origin (same response from a laptop in Vancouver as from a Railway container), **not** about User-Agent (browser-spoofed UA returns the same 401), **not** about token scope (PUT with the same token works fine), and **not** about credential rotation (token was just refreshed; reauth was clean).
+
+The likely root cause: Strava's anti-abuse / app-tiering system. Apps in the default "Limited Access" tier appear to be allowed full READ + write (`POST /uploads`, `PUT /activities`) but blocked from `DELETE /activities/{id}` on real activities. The "Application internal invalid" error is Strava's way of saying "your app isn't in a tier that's permitted to do this." This is undocumented and only visible by hitting the endpoint.
+
+**Side improvements that did land in 2.1:**
+
+- `_persist_env` bug: when `.env` doesn't exist (Railway), the function early-returned and `os.environ` never got the refreshed token, so every API call triggered a redundant token refresh. Now it always patches `os.environ`.
+- `find_activity_near` got verbose logging (search window, candidates, distance diffs) — invaluable for diagnosing this.
+- `delete_activity` now logs token prefix + uses `flush=True` so the failure line isn't lost to gunicorn stdout buffering (which is what happened in early diagnostic runs).
+
+**Net state.** v2.1 deploys cleanly and survives the iOS Shortcut roundtrip, but the underlying delete-and-reupload pipeline cannot complete its goal on a real run. The pipeline only fully works in artificial tests where there's no Garmin auto-synced Strava copy to fight against.
+
+## Full attack-surface map
+
+After Approach 6 hit the DELETE wall, we mapped out every conceivable place in the chain where distance could be modified. Most of these were already covered, ruled out, or are open questions. Keeping the map here so future-us doesn't have to redo it.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│ Step 1. Garmin watch — records run, computes distance                  │
+├────────────────────────────────────────────────────────────────────────┤
+│ A1. Connect IQ data field — can read sensors, cannot overwrite GPS-    │
+│     derived distance                                                    │
+│ A2. Footpod stride / wheel calibration — indoor only, not useful for   │
+│     GPS runs                                                            │
+│ A3. Manual pause/resume — requires user action every run, not auto     │
+│ A4. Third-party recording app, watch as sensor only — complex, bad UX  │
+└────────────────────────────────────────────────────────────────────────┘
+                          ↓ BLE
+┌────────────────────────────────────────────────────────────────────────┐
+│ Step 2. Phone Garmin Connect app — receives BLE stream                 │
+├────────────────────────────────────────────────────────────────────────┤
+│ B1. App edit screen — GPS activity distance not editable               │
+│ B2. Intercept BLE — needs root + offline-protocol RE                   │
+└────────────────────────────────────────────────────────────────────────┘
+                          ↓
+┌────────────────────────────────────────────────────────────────────────┐
+│ Step 3. Garmin Connect cloud — stores activity                         │
+├────────────────────────────────────────────────────────────────────────┤
+│ C1. Web UI distance edit — locked for GPS activities                   │
+│ C2. python-garminconnect API — no set_distance endpoint                │
+│ C3. Delete + re-upload TCX — loses Garmin's private analytics fields   │
+│     (Body Battery, Hill Score, Training Effect, Running Dynamics)      │
+│ C4. Delete + re-upload FIT (preserving unknown_X messages byte-for-    │
+│     byte) — preserves analytics if a Python FIT writer can round-trip  │
+│     unknown messages losslessly. 3-5 days work, unverified.            │
+│ C5. Modify only record.distance and session.total_distance in FIT,     │
+│     leaving position_lat/long untouched — preserves the map but        │
+│     creates internal inconsistency, unclear if Strava/Garmin use the   │
+│     declared distance vs re-derive from positions                      │
+└────────────────────────────────────────────────────────────────────────┘
+                          ↓ Garmin → Strava auto-sync push
+┌────────────────────────────────────────────────────────────────────────┐
+│ Step 4. Strava receives the push                                       │
+├────────────────────────────────────────────────────────────────────────┤
+│ D1. Intercept the Garmin → Strava push — impossible, server-to-server  │
+│ D2. Beat Garmin to it (upload modified copy first, let Garmin's copy   │
+│     get dedup-rejected) — timing window is 1-5 min, unreliable         │
+└────────────────────────────────────────────────────────────────────────┘
+                          ↓
+┌────────────────────────────────────────────────────────────────────────┐
+│ Step 5. Activity now lives on Strava                                   │
+├────────────────────────────────────────────────────────────────────────┤
+│ E1. PUT /activities/{id} with distance field — field not in            │
+│     UpdatableActivity schema, silently ignored                         │
+│ E2. POST /uploads with modified file — dedup rejects                   │
+│ E3. DELETE /activities/{id} — 401 Application internal invalid for     │
+│     Limited-tier apps (Approach 6)                                     │
+│ E4. Strava web Crop feature — UI still exists, trims start/end of GPS  │
+│     track to reduce distance. Web-only, no public API. Reachable via   │
+│     session cookie? Unverified — next thing to investigate.            │
+│ E5. Strava web distance edit — removed around 2024 (Approach 2)        │
+│ E6. Request elevated app tier from Strava — 2-4 week wait, ~30%        │
+│     approval odds based on community reports                           │
+│ E7. Time-shifted upload (Plan B) — creates two activities for one      │
+│     run, visible to friends. Functionally works but UX rejected.       │
+└────────────────────────────────────────────────────────────────────────┘
+                          ↓
+                  Strava displays distance
+```
+
+**Currently being investigated (Approach 7):** E4 — replicate Strava's web crop request from outside the browser. If `_strava4_session` cookie auth works for crop (it works for read; we know POST forms historically worked too before the distance field was removed), we can reduce distance by trimming the GPS stream. The geometry change is more visible than the uniform scale (you lose a chunk off one end of the route) but the operation modifies the existing Strava activity in place — no delete, no dedup, no Garmin-side change, no lost kudos.
+
 ## Lessons
 
 - **Don't try to modify data Strava already owns.** Strava treats every GPS activity's distance as a derived value. There is no API and no UI surface to override it, and the company appears to be removing the few that existed.
 - **Intercept before the source-of-truth.** Modifying TCX/FIT before upload is the only stable pattern.
 - **Webhook architectures aren't worth building for personal use** when the underlying API is closed (Garmin) or hostile to your goal (Strava). A 30-second CLI you run yourself is more reliable and cheaper than a 24/7 service that fails silently.
 - **Test with the actual page, not just the API.** We spent v1.5 building a web form scraper assuming the distance field still existed in the HTML. It didn't. One DevTools peek would have saved that work.
+- **A working pipeline isn't a finished feature.** v2.1 deploys, the iOS Shortcut fires, the server responds — looks complete. But the Strava `DELETE` step it depends on silently 401s in production. Always probe each step's actual *outcome* on the real target, not just whether the code ran.
+- **Token rotation doesn't mean token replacement.** After regenerating Strava's Client Secret and re-authorizing, the old refresh token was still active (Strava reuses refresh tokens across re-auths within the same grant context). We had to explicitly *revoke* the app in Strava settings before reauth would actually mint a new refresh token.
 
 ## Archive
 
