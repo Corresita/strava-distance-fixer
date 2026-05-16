@@ -162,6 +162,8 @@ def find_activity_near(
     after = int((dt - timedelta(minutes=window_minutes)).timestamp())
     before = int((dt + timedelta(minutes=window_minutes)).timestamp())
 
+    print(f"[strava] searching activities: after={after}, before={before}, "
+          f"expected={expected_distance_m:.0f}m")
     resp = requests.get(
         "https://www.strava.com/api/v3/athlete/activities",
         headers={"Authorization": f"Bearer {token}"},
@@ -173,6 +175,7 @@ def find_activity_near(
         return None
 
     candidates = resp.json()
+    print(f"[strava]   found {len(candidates)} activities in window")
     best = None
     best_diff = None
     for a in candidates:
@@ -180,9 +183,14 @@ def find_activity_near(
         if expected_distance_m == 0:
             return a  # no constraint
         diff = abs(d - expected_distance_m) / expected_distance_m
+        print(f"[strava]     candidate id={a.get('id')} dist={d:.0f}m diff={diff:.4f}")
         if diff <= 0.10 and (best_diff is None or diff < best_diff):
             best = a
             best_diff = diff
+    if best:
+        print(f"[strava]   picked best match: id={best['id']}")
+    else:
+        print(f"[strava]   no match within 10% distance tolerance")
     return best
 
 
