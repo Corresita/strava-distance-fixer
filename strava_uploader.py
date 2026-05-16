@@ -34,7 +34,14 @@ def _env(key: str) -> str:
 
 
 def _persist_env(updates: dict[str, str]) -> None:
-    """Rewrite .env in place, replacing or appending the listed keys."""
+    """Rewrite .env in place if it exists, and always patch os.environ so the
+    running process sees the new values immediately. On Railway there is no
+    .env file (env vars come from the platform), so the file write is a no-op
+    but os.environ still gets updated to avoid refreshing on every call."""
+    # Always patch os.environ first — works for both local .env and Railway env vars.
+    for k, v in updates.items():
+        os.environ[k] = v
+
     env_path = Path(__file__).parent / ".env"
     if not env_path.exists():
         return
@@ -49,9 +56,6 @@ def _persist_env(updates: dict[str, str]) -> None:
         if k not in seen:
             lines.append(f"{k}={v}")
     env_path.write_text("\n".join(lines) + "\n")
-    # Also patch the live env so the rest of this process sees new values
-    for k, v in updates.items():
-        os.environ[k] = v
 
 
 def get_access_token() -> str:
