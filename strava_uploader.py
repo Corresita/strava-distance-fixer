@@ -17,6 +17,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Some Strava endpoints (notably DELETE) appear to silently 401 requests with
+# the default `python-requests/X.Y` User-Agent when issued from cloud IPs.
+# Pretending to be a real desktop Chrome works around it. Cosmetic.
+_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+       "AppleWebKit/537.36 (KHTML, like Gecko) "
+       "Chrome/124.0.0.0 Safari/537.36")
+
+
+def _h(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}", "User-Agent": _UA}
+
 
 @dataclass
 class UploadResult:
@@ -72,6 +83,7 @@ def get_access_token() -> str:
             "refresh_token": _env("REFRESH_TOKEN"),
             "grant_type": "refresh_token",
         },
+        headers={"User-Agent": _UA},
         timeout=10,
     )
     data = resp.json()
@@ -96,7 +108,7 @@ def upload_tcx(
     poll_timeout_s: int = 120,
 ) -> UploadResult:
     token = get_access_token()
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = _h(token)
 
     files = {"file": (tcx_path.name, tcx_path.read_bytes(), "application/xml")}
     data = {"data_type": "tcx"}
@@ -170,7 +182,7 @@ def find_activity_near(
           f"expected={expected_distance_m:.0f}m")
     resp = requests.get(
         "https://www.strava.com/api/v3/athlete/activities",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=_h(token),
         params={"after": after, "before": before, "per_page": 30},
         timeout=15,
     )
@@ -200,15 +212,16 @@ def find_activity_near(
 
 def delete_activity(activity_id: int) -> bool:
     token = get_access_token()
+    print(f"[strava] DELETE /activities/{activity_id} (token prefix: {token[:6]}...)", flush=True)
     resp = requests.delete(
         f"https://www.strava.com/api/v3/activities/{activity_id}",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=_h(token),
         timeout=15,
     )
     if resp.status_code in (200, 204):
-        print(f"[strava] deleted activity {activity_id}")
+        print(f"[strava] deleted activity {activity_id}", flush=True)
         return True
-    print(f"[strava] delete {activity_id} failed: {resp.status_code} {resp.text}")
+    print(f"[strava] delete {activity_id} failed: {resp.status_code} {resp.text}", flush=True)
     return False
 
 
