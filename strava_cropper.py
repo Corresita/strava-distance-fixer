@@ -195,6 +195,16 @@ def crop_to_distance(
         )
     print(f"[crop]   POST truncate -> {resp.status_code}")
 
+    # Auto-rotate the session cookie. Strava issues a fresh _strava4_session on
+    # most responses; persisting it back keeps the cookie effectively immortal as
+    # long as the script runs at least every few weeks.
+    rotated = s.cookies.get("_strava4_session", domain=".strava.com") \
+        or s.cookies.get("_strava4_session")
+    if rotated and rotated != session_cookie:
+        print(f"[crop]   rotating _strava4_session ({session_cookie[:6]}... -> {rotated[:6]}...)",
+              flush=True)
+        strava_uploader._persist_env({"STRAVA_SESSION_COOKIE": rotated})
+
     return CropResult(
         activity_id=activity_id,
         original_distance_m=original_m,

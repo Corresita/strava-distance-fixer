@@ -44,29 +44,71 @@ def _env(key: str) -> str:
     return val
 
 
+def _railway_upsert_vars(updates: dict[str, str]) -> None:
+    """If running on Railway and a service account token is configured, push
+    the env var updates back to Railway so they survive container restarts.
+    Silently noops without the four RAILWAY_* env vars."""
+    api_token = os.environ.get("RAILWAY_API_TOKEN", "")
+    project_id = os.environ.get("RAILWAY_PROJECT_ID", "")
+    service_id = os.environ.get("RAILWAY_SERVICE_ID", "")
+    environment_id = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
+    if not all((api_token, project_id, service_id, environment_id)):
+        return
+    try:
+        r = requests.post(
+            "https://backboard.railway.app/graphql/v2",
+            headers={"Authorization": f"Bearer {api_token}", "User-Agent": _UA},
+            json={
+                "query": "mutation V($i: VariableCollectionUpsertInput!) { variableCollectionUpsert(input: $i) }",
+                "variables": {
+                    "i": {
+                        "projectId": project_id,
+                        "serviceId": service_id,
+                        "environmentId": environment_id,
+                        "variables": updates,
+                    }
+                },
+            },
+            timeout=10,
+        )
+        body = r.json()
+        if "errors" in body:
+            print(f"[railway] var upsert failed: {body['errors']}", flush=True)
+        else:
+            print(f"[railway] updated {list(updates.keys())}", flush=True)
+    except Exception as e:
+        print(f"[railway] var upsert error: {e}", flush=True)
+
+
 def _persist_env(updates: dict[str, str]) -> None:
-    """Rewrite .env in place if it exists, and always patch os.environ so the
-    running process sees the new values immediately. On Railway there is no
-    .env file (env vars come from the platform), so the file write is a no-op
-    but os.environ still gets updated to avoid refreshing on every call."""
-    # Always patch os.environ first — works for both local .env and Railway env vars.
+    """Rewrite .env in place if it exists, always patch os.environ so the
+    running process sees the new values immediately, and push the values back
+    to Railway via its GraphQL API if RAILWAY_* env vars are configured.
+
+    On Railway containers there's no .env file (env vars come from the platform),
+    so the file write is a no-op but the Railway-side upsert keeps the values
+    alive across restarts."""
+    # 1. Patch in-process os.environ immediately.
     for k, v in updates.items():
         os.environ[k] = v
 
+    # 2. Persist to local .env if present.
     env_path = Path(__file__).parent / ".env"
-    if not env_path.exists():
-        return
-    lines = env_path.read_text().splitlines()
-    seen = set()
-    for i, line in enumerate(lines):
+    if env_path.exists():
+        lines = env_path.read_text().splitlines()
+        seen = set()
+        for i, line in enumerate(lines):
+            for k, v in updates.items():
+                if line.startswith(f"{k}="):
+                    lines[i] = f"{k}={v}"
+                    seen.add(k)
         for k, v in updates.items():
-            if line.startswith(f"{k}="):
-                lines[i] = f"{k}={v}"
-                seen.add(k)
-    for k, v in updates.items():
-        if k not in seen:
-            lines.append(f"{k}={v}")
-    env_path.write_text("\n".join(lines) + "\n")
+            if k not in seen:
+                lines.append(f"{k}={v}")
+        env_path.write_text("\n".join(lines) + "\n")
+
+    # 3. Push to Railway env vars so they survive container restarts.
+    _railway_upsert_vars(updates)
 
 
 def get_access_token() -> str:
