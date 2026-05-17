@@ -1,5 +1,29 @@
 # Changelog
 
+## [2.2.0] - 2026-05-16
+
+Pipeline pivot: replace the "delete the auto-synced Strava copy, upload a scaled version" approach (blocked by Strava's `DELETE` 401 — see 2.1.0) with **modify the existing Strava activity in place** by replaying its web "Crop / truncate" form. Same activity ID, same kudos, same comments — just trim a few GPS points off the end to land on N.NN km.
+
+### Added
+- `strava_cropper.py` — fetches the activity's distance stream via OAuth, binary-searches for the `end_index` whose cumulative distance is closest to (but ≤) the target, scrapes the CSRF token from `/activities/{id}/truncate`, and POSTs the same form a logged-in browser submits to crop. Result: distance lands within a few meters of target (~6m for an 8 km run with ~3m-spaced GPS points).
+- `STRAVA_SESSION_COOKIE` env var required for the crop step (OAuth API doesn't expose `/truncate`).
+
+### Changed
+- `sync.py` is now ~30% shorter and much simpler. New flow: find latest Garmin running activity → wait for it to auto-sync to Strava → crop that Strava activity. No TCX download, no GPS scaling, no upload, no delete.
+- `HistoryEntry` schema replaced: `pipeline_path` is now `cropped` / `skipped_existing` / `skipped_short` / `no_activity` / `failed`; new fields `final_km` and `points_dropped` replace `scale_factor` / `strava_deleted_id` / `strava_new_id` / `fallback_reason`.
+- `sync_server.py` drops the `?no_delete=` URL parameter (the underlying pipeline no longer has a delete step to skip).
+
+### Removed (still in repo, no longer wired up)
+- `tcx_scaler.py` — GPS-path scaling. Kept in the tree as a reference / fallback option but no longer imported by sync. The crop approach made it obsolete.
+
+### Verified
+- 2026-05-16 17:50 local: cropped activity 18532273416 (`Morning Run`) from 8086.30 m → 8079.80 m (= 8.08 km). All 18 kudos preserved, HR / cadence / pace unchanged, activity ID unchanged. The whole pipeline ran in under 5 seconds.
+
+### Operational note
+The cookie expires periodically. When sync stops working with HTTP 401s at the crop step, capture a fresh `_strava4_session` from a logged-in browser and update the env var (locally and on Railway). Sign-out-everywhere in Strava settings invalidates all existing cookies — useful to rotate after any credential exposure.
+
+---
+
 ## [2.1.0] - 2026-05-16
 
 Add HTTP wrapper so the sync can be triggered remotely from an iOS Shortcut — the original `python sync.py` CLI still works locally, but a Flask server (`sync_server.py`) exposes the same pipeline at `POST /sync` for phone-based invocation. Designed for Railway deployment.

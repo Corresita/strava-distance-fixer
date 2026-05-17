@@ -1,56 +1,53 @@
 # Strava Distance Fixer
 
-A small command-line tool that pulls your latest Garmin run, rewrites its distance to a `N.NN km` repeating-digit form (e.g. `19.19 km`, `12.12 km`), and uploads the modified copy to Strava. Your Garmin Connect data is untouched.
+A small tool that rewrites your latest run's distance on Strava to a `N.NN km` repeating-digit form (e.g. `19.19 km`, `12.12 km`). The activity stays in place — same ID, same kudos and comments — we just crop a few GPS points off the end so its distance matches the target. Garmin Connect's copy is untouched.
 
 ## Why this exists
 
-Strava silently re-derives distance from the GPS stream for any activity that has GPS data. The official API's `UpdatableActivity` model doesn't include a `distance` field, and the web edit form removed it sometime around 2024. There is no way to change the distance of an existing GPS activity on Strava.
+Strava re-derives distance from the GPS stream for any GPS activity. The API's `UpdatableActivity` schema has no `distance` field. The web edit form removed its distance input around 2024. Deleting a Garmin-synced activity via API returns 401 on default-tier apps. Every "change distance after upload" path is closed — except one: Strava's web **Crop** feature trims the GPS stream's start/end and recomputes distance, and it's reachable from outside the browser with a session cookie.
 
-The workaround: modify the GPS track itself before Strava sees it. Pull the activity from Garmin, scale every GPS point uniformly toward the start position so the total path length equals the target, then upload the modified copy as a new activity. Strava treats it as a fresh upload, recomputes distance from the (scaled) stream, and the number persists.
+The whole `docs/journey.md` documents the four approaches that failed before this one worked.
 
 ## How it works
 
 ```
 Garmin watch ──▶ Garmin Connect ──▶ Strava (auto-sync, original distance)
-                       │                       ▲
-                       │                       │ (5) upload scaled TCX
-                       ▼                       │
-                  [you run sync.py] ───────────┘
-                       │                       ▲
-                       ├─ (1) download TCX     │
-                       ├─ (2) scale GPS path   │
-                       ├─ (3) find Strava ─────┘
-                       │      auto-synced copy
-                       └─ (4) delete it
+                                            │
+                                            │ POST /activities/{id}/truncate
+                                            ▼   (start_index=0, end_index=N)
+                                    [you run sync.py]
+                                            │
+                                            ▼
+                                    Strava activity now N.NN km
+                                    (same activity, all kudos retained)
 ```
 
-The script keeps Garmin Connect's direct sync to Strava on, lets the original arrive there, then replaces it. Steps:
+Steps inside `sync.py`:
 
-1. Pull the TCX from Garmin (cached OAuth, no MFA after the first time)
-2. Scale the GPS path uniformly so the total path length equals the `N.NN` km target
-3. Search Strava for the auto-synced copy of this same run (matched by start time ±15 min and distance ±10 %)
-4. Delete the auto-synced copy
-5. Upload the scaled TCX as a fresh activity
-6. If step 5 fails for any reason, fall back to uploading the **un-scaled original** TCX so the activity still lands on Strava — you just don't get the `N.NN` cosmetics
+1. Garmin: find latest running activity (cached OAuth token, no MFA after first run).
+2. Compute the `N.NN` km target from the original distance.
+3. Wait up to 3 minutes for Garmin Connect's auto-sync to push the activity to Strava (matched by start time ±15 min and distance ±10 %).
+4. `GET /api/v3/activities/{id}/streams?keys=distance` → cumulative-meters array, one entry per GPS point.
+5. Binary-search for the largest index whose cumulative distance is ≤ the target.
+6. `GET /activities/{id}/truncate` (with session cookie) → scrape Rails CSRF token from the form.
+7. `POST /activities/{id}/truncate` with `start_index=0, end_index=<computed>`. Strava re-derives distance from the trimmed range.
 
-Why steps 3–4 are needed: Strava deduplicates uploads by start time + GPS overlap, so without deleting the Garmin auto-synced copy first, our scaled upload is rejected as a duplicate.
-
-What gets scaled in the TCX:
-- `<LatitudeDegrees>` / `<LongitudeDegrees>` on every trackpoint (anchored to the first point so the route stays in the right place)
-- `<DistanceMeters>` on every trackpoint and every lap
-- `<Speed>` in the TPX extension (so pace stays consistent with the new distance)
+What changes:
+- Activity's distance becomes ≤ target (typically within 2-3 m, since GPS points are ~3 m apart).
+- A few GPS points at the end of the route are permanently dropped.
 
 What stays untouched:
-- Timestamps — total duration is unchanged
-- Heart rate, cadence, power — measured values, scaling them would be data fabrication
-- Altitude — geometrically tied to position; for the ~0.05 % shrink we typically apply, the slope difference is invisible
+- Activity ID, kudos, comments, name, sport type — none of that is recreated.
+- HR / cadence / power / altitude — Strava preserves these streams across crop.
+- Garmin Connect — the script never writes to Garmin. The full original recording stays in Garmin Connect with all private analytics (Body Battery, Hill Score, Training Effect).
 
-For a 19.200 km activity the target is 19.19 km, a 0.05 % shrink. The map track is ~10 m shorter than the real route — invisible to the eye.
+Strava's own UI warns "This action cannot be undone." Cropped GPS points really are gone. For a 19.200 km run trimmed to 19.19 km, that's ~10 m off the end of the route — invisible. For an 8.32 km run trimmed to 8.08 km, that's ~240 m — small but visible if you look at the map closely.
 
 ## Requirements
 
-- Garmin account with the direct Garmin → Strava sync **enabled** (Garmin Connect → Settings → Connected Apps → Strava). The script relies on the auto-synced copy as a fallback target.
-- Strava API app credentials (https://www.strava.com/settings/api) with `activity:write` scope.
+- Garmin Connect → Strava direct sync **enabled** (Garmin Connect → Settings → Connected Apps → Strava). The auto-synced activity is what we crop.
+- Strava API app credentials (https://www.strava.com/settings/api) with `activity:read_all` scope (for the streams API). `activity:write` is not used by the crop path but is harmless to keep.
+- A Strava web session cookie (`_strava4_session`) captured from a logged-in browser — see `.env.example`.
 - Python 3.12+, dependencies in `requirements.txt`.
 
 ## Setup
@@ -62,9 +59,10 @@ pip install -r requirements.txt
 
 # Credentials
 cp .env.example .env
-# Fill in GARMIN_EMAIL / GARMIN_PASSWORD and Strava CLIENT_ID / CLIENT_SECRET
+# Fill in GARMIN_EMAIL / GARMIN_PASSWORD, Strava CLIENT_ID / CLIENT_SECRET,
+# and STRAVA_SESSION_COOKIE (see .env.example for where to copy that from).
 
-# Authorize Strava (opens browser, captures the code on localhost:8765)
+# Authorize Strava OAuth (opens browser, captures the code on localhost:8765)
 python reauth_strava.py
 ```
 
@@ -74,25 +72,25 @@ The Strava app's "Authorization Callback Domain" in https://www.strava.com/setti
 
 ```bash
 python sync.py                  # process latest Garmin running activity
-python sync.py 22883472799      # process a specific Garmin activity ID
+python sync.py 22903731984      # process a specific Garmin activity ID
 python sync.py --force          # re-process even if history.json has it
-python sync.py --no-delete      # skip the "find + delete Strava copy" step
-                                # (use this if Garmin → Strava auto-sync is off)
 ```
 
-End-to-end takes about 30 seconds:
+Wall-clock: a few seconds plus however long Garmin takes to push to Strava (typically ~1 minute after a run ends; the script polls for up to 3 minutes).
 
 ```
 $ python sync.py
-2026-05-14 22:01:03  INFO  Logging into Garmin...
-2026-05-14 22:01:04  INFO  Looking up latest running activity...
-2026-05-14 22:01:05  INFO  Activity 22883472799: 'Trail Run'  19.1996 km
-2026-05-14 22:01:05  INFO  Target: 19.19 km
-2026-05-14 22:01:05  INFO  Downloading TCX from Garmin...
-2026-05-14 22:01:07  INFO    got 11034421 bytes
-2026-05-14 22:01:08  INFO    scaled: 19.1996 km -> 19.1900 km  (k=0.999502)
-2026-05-14 22:01:08  INFO  Uploading to Strava...
-2026-05-14 22:01:25  INFO  ✓ DONE  https://www.strava.com/activities/18512945963  (19.19 km)
+2026-05-16 19:00:00  INFO  Logging into Garmin...
+2026-05-16 19:00:01  INFO  Looking up latest running activity...
+2026-05-16 19:00:02  INFO  Activity 22903731984: 'Morning Run'  8.1240 km  start=2026-05-16T15:55:57Z
+2026-05-16 19:00:02  INFO  Target: 8.08 km (8080 m)
+2026-05-16 19:00:02  INFO    waiting up to 180s for Garmin → Strava auto-sync...
+2026-05-16 19:00:03  INFO    found Strava activity 18532273416 (8.1240 km)
+2026-05-16 19:00:03  INFO  Cropping Strava activity 18532273416 to 8.08 km...
+[crop]   stream has 2672 points, original distance 8086.30m
+[crop]   chosen end_index=2669 -> distance 8079.80m (dropping 2 points, 6.5m off the end)
+[crop]   POST truncate -> 200
+2026-05-16 19:00:05  INFO  ✓ DONE  cropped  https://www.strava.com/activities/18532273416  (8.1240 → 8.0798 km, dropped 2 points)
 ```
 
 The first Garmin login is interactive: a 6-digit MFA code arrives by email, you paste it in. Subsequent runs reuse the cached OAuth token in `garmin_tokens/` (good for ~1 year) and skip the MFA dance entirely.
@@ -104,24 +102,28 @@ The first three versions of this project tried to modify activities **after** th
 ## Files
 
 ```
-sync.py              main entry point
-garmin_client.py     Garmin Connect login + activity fetch + TCX download
-tcx_scaler.py        GPS-path scaling logic
-strava_uploader.py   Strava OAuth refresh + multipart upload + status poll
-reauth_strava.py     one-shot Strava re-authorization helper
+sync.py              main entry point — finds latest Garmin run, waits for Strava sync, crops
+strava_cropper.py    binary-search for end_index, POST truncate form via session cookie
+garmin_client.py     Garmin Connect login + activity fetch (TCX download no longer used)
+strava_uploader.py   Strava OAuth refresh + activity search helper
+reauth_strava.py     one-shot Strava OAuth re-authorization helper
+sync_server.py       optional Flask wrapper for iOS-Shortcut / Railway use
+tcx_scaler.py        v2.0 GPS-path scaler — kept as reference, not wired up
 history.json         per-run record (auto-created)
 sync.log             append-only log (auto-created)
 garmin_tokens/       cached Garmin OAuth1 token (auto-created)
-docs/                Strava API reference notes
+docs/                journey + Strava API reference notes
 ```
 
 ## Failure modes
 
-- **TCX scaling fails** — the script falls back to uploading the un-scaled original TCX. The activity still lands on Strava, just at its real distance. `history.json` records `"pipeline_path": "fallback_original"` and the reason.
-- **Scaled upload fails** — same fallback: upload the original. `history.json` records both failure reasons.
-- **Both uploads fail** — `history.json` records `"pipeline_path": "failed"`. The original activity from Garmin's auto-sync is already gone (we deleted it earlier in the pipeline), so manually export GPX/TCX from Garmin Connect and drag it into Strava's upload page.
-- **Strava auto-synced copy not found within 3 min** — script proceeds anyway and uploads the scaled TCX clean. If a duplicate ever shows up later, just delete one of the two manually.
-- **Garmin token cache expired (~1 year)** — first run after that needs a fresh interactive login with MFA. Re-running with the live email open is enough.
+- **Strava auto-synced copy not found within 3 min** — the script logs failure with `pipeline_path=failed` and exits. Try again in a few minutes once Garmin Connect has pushed.
+- **Crop returns HTTP 401 / login redirect** — your `_strava4_session` cookie expired. Recapture it from a browser (see `.env.example`) and update the env var.
+- **Crop returns HTTP 5xx** — Strava-side issue, transient. `history.json` records the error. Re-run with `--force` later.
+- **Garmin token cache expired (~1 year)** — first run after that needs a fresh interactive login with MFA. Re-run from a terminal with your email open, paste the code, done.
+- **Activity is under 1 km** — skipped silently (N.NN with N=0 isn't a meaningful target).
+
+In all failure modes, the Strava activity itself is left exactly as Garmin's auto-sync delivered it. Nothing is destroyed; the worst case is your distance doesn't get the cosmetic trim.
 
 ## history.json
 
@@ -129,12 +131,12 @@ Each `sync.py` run appends one record. Useful fields:
 
 | Field | Meaning |
 | --- | --- |
-| `pipeline_path` | `scaled_uploaded` (success) / `fallback_original` (uploaded un-scaled) / `skipped_existing` / `failed` |
-| `original_km` / `target_km` | Original distance and the `N.NN` target |
-| `scale_factor` | The multiplier applied (≈ 0.99 to 1.01 for typical runs) |
-| `strava_deleted_id` | The Garmin-auto-synced Strava activity we replaced, or `null` |
-| `strava_new_id` | The Strava activity we created, or `null` |
-| `fallback_reason` / `error` | Diagnostic strings when something went wrong |
+| `pipeline_path` | `cropped` (success) / `skipped_existing` / `skipped_short` / `no_activity` / `failed` |
+| `original_km` / `target_km` | Original distance reported by Garmin and the `N.NN` target |
+| `final_km` | Distance Strava ended up showing after the crop |
+| `points_dropped` | How many GPS points we trimmed off the end |
+| `strava_activity_id` | The Strava activity we modified (unchanged across runs) |
+| `error` | Diagnostic string when something went wrong, else `null` |
 
 ## Security notes
 

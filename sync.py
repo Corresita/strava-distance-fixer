@@ -3,20 +3,22 @@
 Usage:
     python sync.py                 # process latest Garmin running activity
     python sync.py <activity_id>   # process a specific Garmin activity
-    python sync.py --force         # re-process latest even if already in history
+    python sync.py --force         # re-process even if already in history
 
 Pipeline:
-    Garmin Connect → download TCX → scale GPS path to N.NN km
-                                  → find the Strava activity that Garmin
-                                    auto-synced and delete it
-                                  → upload the scaled TCX
-                                  → if scaled upload fails, fall back to
-                                    uploading the original (un-scaled) TCX
-                                    so the activity always lands on Strava
+    1. Find the latest Garmin running activity (or one by ID).
+    2. Compute the N.NN km target.
+    3. Wait for Garmin Connect's auto-sync to push the activity to Strava.
+    4. Crop the Strava activity (via web `truncate` form) down to N.NN km.
 
-This requires Garmin Connect's direct sync to Strava to remain ON: that
-sync pushes the original activity into Strava, we delete it, and upload our
-modified copy. Garmin Connect data itself is never touched.
+The Strava activity stays in place — same ID, same kudos, same comments.
+We just trim a handful of GPS points off the end so its distance matches
+the target. Nothing is deleted, no re-upload, no duplicates.
+
+The crop requires `_strava4_session` cookie (Strava web session) since the
+public OAuth API doesn't expose this operation. Capture the cookie from a
+logged-in browser and put it in env var `STRAVA_SESSION_COOKIE`. Cookies
+last weeks-to-months; refresh when the script reports a 401 / login redirect.
 """
 from __future__ import annotations
 
@@ -24,7 +26,6 @@ import argparse
 import json
 import logging
 import sys
-import tempfile
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -33,8 +34,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 import garmin_client
+import strava_cropper
 import strava_uploader
-import tcx_scaler
 
 load_dotenv()
 
@@ -60,11 +61,10 @@ class HistoryEntry:
     garmin_name: str
     original_km: float
     target_km: float
-    pipeline_path: str  # scaled_uploaded | fallback_original | skipped_existing | failed
-    scale_factor: float | None
-    strava_deleted_id: int | None
-    strava_new_id: int | None
-    fallback_reason: str | None
+    pipeline_path: str  # cropped | skipped_existing | skipped_short | no_activity | failed
+    strava_activity_id: int | None
+    final_km: float | None
+    points_dropped: int | None
     error: str | None
 
 
@@ -85,12 +85,13 @@ def append_history(entry: HistoryEntry) -> None:
 
 def already_synced(garmin_id: int) -> bool:
     for e in load_history():
-        if e.get("garmin_activity_id") == garmin_id and e.get("strava_new_id"):
+        if e.get("garmin_activity_id") == garmin_id and e.get("pipeline_path") == "cropped":
             return True
     return False
 
 
 def target_km(distance_m: float) -> float | None:
+    """Round to the repeating-digit N.NN km form. Return None if < 1 km."""
     km = distance_m / 1000.0
     n = int(km)
     if n == 0:
@@ -102,8 +103,7 @@ def wait_for_garmin_sync_to_strava(
     start_iso: str, expected_m: float, deadline_s: int = 180
 ) -> dict | None:
     """Garmin auto-sync to Strava is typically <2 min after activity completion.
-    Poll until we see the activity show up so we can delete it before uploading
-    our scaled version. Returns the Strava activity dict or None on timeout."""
+    Poll until we see the activity show up on Strava."""
     log.info(f"  waiting up to {deadline_s}s for Garmin → Strava auto-sync...")
     end = time.time() + deadline_s
     while time.time() < end:
@@ -112,13 +112,13 @@ def wait_for_garmin_sync_to_strava(
             log.info(f"  found Strava activity {found['id']} ({found.get('distance', 0)/1000:.4f} km)")
             return found
         time.sleep(10)
-    log.info(f"  no auto-synced Strava activity found within {deadline_s}s — uploading clean")
+    log.info(f"  no auto-synced Strava activity found within {deadline_s}s")
     return None
 
 
-def run(activity_id: int | None, force: bool, no_delete: bool) -> dict:
+def run(activity_id: int | None, force: bool) -> dict:
     log.info("=" * 70)
-    log.info(f"sync started  force={force}  activity_id={activity_id}  no_delete={no_delete}")
+    log.info(f"sync started  force={force}  activity_id={activity_id}")
     ts_now = datetime.now().isoformat(timespec="seconds")
 
     log.info("Logging into Garmin...")
@@ -129,7 +129,8 @@ def run(activity_id: int | None, force: bool, no_delete: bool) -> dict:
         activity = garmin_client.latest_running_activity(client)
         if activity is None:
             log.error("No recent GPS running activity found.")
-            return {"ok": False, "pipeline_path": "no_activity", "error": "no recent GPS running activity"}
+            return {"ok": False, "pipeline_path": "no_activity",
+                    "error": "no recent GPS running activity"}
         activity_id = activity["activityId"]
     else:
         activity = garmin_client.get_activity(client, activity_id)
@@ -144,106 +145,73 @@ def run(activity_id: int | None, force: bool, no_delete: bool) -> dict:
 
     if not force and already_synced(activity_id):
         log.info("Already synced (use --force to redo). Done.")
-        entry = HistoryEntry(
-            ts=ts_now, garmin_activity_id=activity_id, garmin_name=garmin_name,
-            original_km=original_km, target_km=0.0, pipeline_path="skipped_existing",
-            scale_factor=None, strava_deleted_id=None, strava_new_id=None,
-            fallback_reason=None, error=None,
-        )
-        append_history(entry)
-        return {"ok": True, **asdict(entry), "strava_url": None}
+        return {"ok": True, "pipeline_path": "skipped_existing",
+                "garmin_activity_id": activity_id, "garmin_name": garmin_name,
+                "original_km": original_km, "error": None}
 
     tgt_km = target_km(original_m)
     if tgt_km is None:
         log.info("Under 1 km, skipping.")
-        return {"ok": True, "pipeline_path": "skipped_short", "garmin_activity_id": activity_id,
-                "garmin_name": garmin_name, "original_km": original_km, "target_km": None,
-                "error": None}
+        return {"ok": True, "pipeline_path": "skipped_short",
+                "garmin_activity_id": activity_id, "garmin_name": garmin_name,
+                "original_km": original_km, "error": None}
     target_m = tgt_km * 1000
 
-    log.info(f"Target: {tgt_km} km")
+    log.info(f"Target: {tgt_km} km ({target_m:.0f} m)")
 
-    log.info("Downloading TCX from Garmin...")
-    tcx_bytes = garmin_client.download_tcx(client, activity_id)
-    log.info(f"  got {len(tcx_bytes)} bytes")
+    if not start_iso:
+        return {"ok": False, "pipeline_path": "failed",
+                "error": "no startTimeGMT/Local on Garmin activity"}
 
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        in_tcx = td / f"{activity_id}.tcx"
-        scaled_tcx = td / f"{activity_id}_scaled.tcx"
-        in_tcx.write_bytes(tcx_bytes)
-
-        # 1. Scale (may fail; record reason if so)
-        scale_factor: float | None = None
-        fallback_reason: str | None = None
-        try:
-            r = tcx_scaler.scale_tcx(in_tcx, scaled_tcx, target_m)
-            scale_factor = r.scale_factor
-            log.info(f"  scaled: {r.original_distance_m/1000:.4f} km -> "
-                     f"{r.target_distance_m/1000:.4f} km  (k={r.scale_factor:.6f})")
-        except Exception as e:
-            fallback_reason = f"scale_failed: {type(e).__name__}: {e}"
-            log.warning(f"  ⚠️  TCX scaling failed: {fallback_reason}")
-            scaled_tcx.write_bytes(tcx_bytes)  # fall back at this stage too
-
-        # 2. Find + delete the Garmin auto-synced copy on Strava (unless --no-delete)
-        deleted_id: int | None = None
-        if not no_delete and start_iso:
-            existing = wait_for_garmin_sync_to_strava(start_iso, original_m)
-            if existing:
-                if strava_uploader.delete_activity(existing["id"]):
-                    deleted_id = existing["id"]
-                    time.sleep(3)  # let the delete propagate before re-upload
-
-        # 3. Upload scaled. If that fails, upload the original (un-modified) TCX
-        # as a safety net so the activity at least exists on Strava.
-        result = None
-        pipeline_path = ""
-        try:
-            log.info("Uploading scaled TCX to Strava...")
-            result = strava_uploader.upload_tcx(
-                scaled_tcx, name=garmin_name, external_id=f"garmin-{activity_id}-scaled",
-            )
-            if result.activity_id:
-                pipeline_path = "scaled_uploaded" if fallback_reason is None else "fallback_original"
-            else:
-                raise RuntimeError(f"Strava processing error: {result.error}")
-        except Exception as e:
-            log.warning(f"  ⚠️  scaled upload failed: {e}; falling back to original TCX")
-            fallback_reason = (fallback_reason + " | " if fallback_reason else "") + f"scaled_upload_failed: {e}"
-            try:
-                result = strava_uploader.upload_tcx(
-                    in_tcx, name=garmin_name, external_id=f"garmin-{activity_id}-original",
-                )
-                pipeline_path = "fallback_original" if result.activity_id else "failed"
-            except Exception as e2:
-                log.error(f"  ✗  fallback upload also failed: {e2}")
-                fallback_reason += f" | fallback_upload_failed: {e2}"
-                pipeline_path = "failed"
-
-        new_id = result.activity_id if result else None
-        error_msg = None if (result and new_id) else (result.error if result else "no upload attempt succeeded")
-
+    strava = wait_for_garmin_sync_to_strava(start_iso, original_m)
+    if strava is None:
         entry = HistoryEntry(
             ts=ts_now, garmin_activity_id=activity_id, garmin_name=garmin_name,
-            original_km=original_km, target_km=tgt_km, pipeline_path=pipeline_path,
-            scale_factor=scale_factor, strava_deleted_id=deleted_id,
-            strava_new_id=new_id, fallback_reason=fallback_reason, error=error_msg,
+            original_km=original_km, target_km=tgt_km, pipeline_path="failed",
+            strava_activity_id=None, final_km=None, points_dropped=None,
+            error="Strava auto-sync did not arrive within 180s",
         )
         append_history(entry)
+        log.error("✗ FAILED  no Strava activity to crop")
+        return {"ok": False, **asdict(entry), "strava_url": None}
 
-        strava_url = f"https://www.strava.com/activities/{new_id}" if new_id else None
-        ok = pipeline_path in ("scaled_uploaded", "fallback_original")
+    strava_id = strava["id"]
+    log.info(f"Cropping Strava activity {strava_id} to {tgt_km} km...")
 
-        if pipeline_path == "scaled_uploaded":
-            log.info(f"✓ DONE  scaled  {strava_url}  ({tgt_km} km)")
-        elif pipeline_path == "fallback_original":
-            log.warning(f"⚠ DONE  original-fallback  {strava_url}  "
-                        f"(distance NOT modified: {original_km:.2f} km)")
-        else:
-            log.error(f"✗ FAILED  {error_msg}")
+    try:
+        result = strava_cropper.crop_to_distance(strava_id, target_m)
+    except Exception as e:
+        entry = HistoryEntry(
+            ts=ts_now, garmin_activity_id=activity_id, garmin_name=garmin_name,
+            original_km=original_km, target_km=tgt_km, pipeline_path="failed",
+            strava_activity_id=strava_id, final_km=None, points_dropped=None,
+            error=f"crop exception: {type(e).__name__}: {e}",
+        )
+        append_history(entry)
+        log.error(f"✗ FAILED  crop raised: {e}")
+        return {"ok": False, **asdict(entry),
+                "strava_url": f"https://www.strava.com/activities/{strava_id}"}
 
-        return {"ok": ok, **asdict(entry), "strava_url": strava_url}
+    entry = HistoryEntry(
+        ts=ts_now, garmin_activity_id=activity_id, garmin_name=garmin_name,
+        original_km=original_km, target_km=tgt_km,
+        pipeline_path="cropped" if result.success else "failed",
+        strava_activity_id=strava_id,
+        final_km=result.final_distance_m / 1000.0,
+        points_dropped=result.points_dropped,
+        error=result.error,
+    )
+    append_history(entry)
+
+    strava_url = f"https://www.strava.com/activities/{strava_id}"
+    if result.success:
+        log.info(f"✓ DONE  cropped  {strava_url}  "
+                 f"({original_km:.4f} → {result.final_distance_m/1000:.4f} km, "
+                 f"dropped {result.points_dropped} points)")
+    else:
+        log.error(f"✗ FAILED  crop returned error: {result.error}")
+
+    return {"ok": result.success, **asdict(entry), "strava_url": strava_url}
 
 
 def main() -> int:
@@ -252,10 +220,8 @@ def main() -> int:
                    help="Garmin activity ID (default: latest running)")
     p.add_argument("--force", action="store_true",
                    help="re-process even if already in history.json")
-    p.add_argument("--no-delete", action="store_true",
-                   help="don't search for / delete the Strava auto-synced copy")
     args = p.parse_args()
-    result = run(args.activity_id, args.force, args.no_delete)
+    result = run(args.activity_id, args.force)
     return 0 if result.get("ok") else 2
 
 

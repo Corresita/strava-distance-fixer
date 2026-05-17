@@ -167,7 +167,50 @@ After Approach 6 hit the DELETE wall, we mapped out every conceivable place in t
                   Strava displays distance
 ```
 
-**Currently being investigated (Approach 7):** E4 — replicate Strava's web crop request from outside the browser. If `_strava4_session` cookie auth works for crop (it works for read; we know POST forms historically worked too before the distance field was removed), we can reduce distance by trimming the GPS stream. The geometry change is more visible than the uniform scale (you lose a chunk off one end of the route) but the operation modifies the existing Strava activity in place — no delete, no dedup, no Garmin-side change, no lost kudos.
+## Approach 7: Strava web Crop / truncate via session cookie (v2.2, works ✓)
+
+After Approach 6 hit the DELETE wall, mapping the attack surface (above) made E4 the obvious next thing to try: Strava's website still has a "Crop Activity" feature that trims the start/end of the GPS stream and recomputes distance. The OAuth API doesn't expose it, but the web form is reachable with a session cookie.
+
+**What the form looks like.** Viewing source of `/activities/{id}/truncate`:
+
+```html
+<form action='/activities/{id}/truncate' method='post'>
+  <input name='authenticity_token' type='hidden' value='…'>
+  <input name='start_index' type='hidden' value='0'>
+  <input name='end_index' type='hidden' value='2675'>
+</form>
+```
+
+Three fields: a Rails CSRF token and two integer indices into the activity's GPS-point array. Cropping is a slider in the UI; the slider sets these two indices; submit POSTs them back. Strava re-derives distance from the trimmed point range.
+
+**Implementation (`strava_cropper.py`).**
+
+1. `GET /api/v3/activities/{id}/streams?keys=distance` (OAuth) → array of cumulative meters per GPS point.
+2. Binary-search for the largest index where `distance[i] ≤ target_m`. That's the `end_index` that gets us to N.NN km without overshooting.
+3. `GET /activities/{id}/truncate` (session cookie) → scrape the `authenticity_token` from the HTML.
+4. `POST /activities/{id}/truncate` (session cookie + CSRF) with `start_index=0`, `end_index=<computed>`.
+
+Strava processes synchronously and the activity is updated in place — same ID, all kudos and comments retained.
+
+**End-to-end test result, 2026-05-16:** activity 18532273416 went from 8086.30 m → 8079.80 m (= 8.08 km) in under 5 seconds. 18 existing kudos preserved. HR / cadence / pace unchanged. Two GPS points (≈6 m) trimmed off the end.
+
+**Why this beats every previous approach:**
+
+| Property | API PUT (v1) | Web edit form (v1.5) | Delete + reupload (v2.1) | Crop (v2.2) |
+| --- | --- | --- | --- | --- |
+| Persists for GPS activities | ✗ (silently reverted) | ✗ (field removed) | ✗ (DELETE 401) | **✓** |
+| Preserves kudos / comments | n/a | n/a | ✗ (delete loses them) | **✓** |
+| Single Strava activity | ✓ | ✓ | needs `delete` | **✓** |
+| Garmin data untouched | ✓ | ✓ | ✓ | **✓** |
+| Works on Railway | ✓ | n/a | ✗ (DELETE 401) | **✓** |
+
+**The costs we accept.**
+
+- **Session cookie maintenance.** `_strava4_session` lives weeks-to-months. When it expires, the script logs an auth failure at the crop step and the user has to recapture from a browser. Same operational burden v1.5 had — and exactly the kind of fragility that killed v1.5 (Strava removed the distance field). The risk is Strava someday removing or restricting the crop form too.
+- **GPS data is irreversibly trimmed.** Strava's own warning: "This action cannot be undone." We chop a few meters off the end of every run. Visible if you look hard at the map; invisible otherwise.
+- **Crop isn't geometric scaling.** v2.0 scaled every GPS point uniformly toward the start — the route shape was preserved, just shrunk by 0.05 %. Crop just lops off the end. For a typical 19 km run trimmed to 19.19 km we lose ~10 m of route ending; for 8.32 km trimmed to 8.08 km we lose ~240 m. Bigger reductions = more visible map clip.
+
+In exchange we get a feature that *actually works in production* on Strava's current platform.
 
 ## Lessons
 

@@ -98,10 +98,9 @@ def trigger_sync():
         return jsonify({"error": f"invalid activity_id: {aid_raw!r}"}), 400
 
     force = (request.args.get("force") or "").lower() in ("1", "true", "yes")
-    no_delete = (request.args.get("no_delete") or "").lower() in ("1", "true", "yes")
 
     try:
-        result = sync.run(aid, force=force, no_delete=no_delete)
+        result = sync.run(aid, force=force)
         status = 200 if result.get("ok") else 500
         return jsonify(result), status
     except Exception as e:
