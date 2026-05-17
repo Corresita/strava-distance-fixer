@@ -212,6 +212,47 @@ Strava processes synchronously and the activity is updated in place — same ID,
 
 In exchange we get a feature that *actually works in production* on Strava's current platform.
 
+## Production form: phone-triggered + self-maintaining (v2.3)
+
+The crop pipeline from Approach 7 works, but a CLI you have to open your laptop for after every run isn't really a feature — most runs end with the person not near their laptop, often without a desire to ever open it.
+
+Three deltas turn the CLI into something you actually use:
+
+**1. HTTP wrapper + Railway deployment.** `sync_server.py` exposes `POST /sync` as a Flask endpoint, gated by an `X-Sync-Secret` header. Deployed to Railway with `Procfile` + `railway.toml`. The server reuses the same `sync.run()` from the CLI — no logic forked.
+
+**2. iOS Shortcut.** Three actions: `Get Contents of URL` (POST to the Railway endpoint with the secret header), `Get Dictionary Value` (extract `strava_url` from the JSON response), `Show Notification` (display the URL). Added to the iPhone home screen. After a run: tap → ~30 seconds → notification with the new Strava URL.
+
+**3. Credential auto-rotation.** The two credentials that previously needed periodic manual refresh now refresh themselves and write back to Railway's env vars:
+
+- **Strava OAuth access token** — already auto-refreshes inside the running process. v2.3 adds a call to Railway's GraphQL `variableCollectionUpsert` mutation after each refresh, so the new token survives container restarts.
+- **`_strava4_session` cookie** — Strava issues a fresh cookie on most responses. We capture it from `requests.Session.cookies` after every `truncate` POST. If it changed, push back to Railway. As long as you run at least once every few weeks, the cookie effectively never expires.
+
+The only credential the system *cannot* auto-rotate is the Garmin OAuth1 token. That's ~1 year, requires interactive MFA over email/SMS, and Strava's rate-limited login endpoint makes the auto path too risky. Documented as a "once-a-year touch" in the README.
+
+End-state architecture:
+
+```
+iPhone home screen
+       │ tap "Strava Fix"
+       ▼
+iOS Shortcuts: POST → https://<railway>/sync
+       │
+       ▼
+Railway container (sync_server.py)
+       │
+       ├─ login Garmin (cached token, no network)
+       ├─ find latest running activity
+       ├─ wait for Garmin → Strava auto-sync
+       ├─ crop the Strava activity to N.NN
+       ├─ capture rotated cookie & token, push back to Railway env vars
+       └─ return JSON
+       │
+       ▼
+iPhone notification: "Strava Fix: https://strava.com/activities/…"
+```
+
+Cost of ownership: opening Garmin Connect once a year to re-issue a token. That's it.
+
 ## Lessons
 
 - **Don't try to modify data Strava already owns.** Strava treats every GPS activity's distance as a derived value. There is no API and no UI surface to override it, and the company appears to be removing the few that existed.

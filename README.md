@@ -1,6 +1,6 @@
 # Strava Distance Fixer
 
-A small tool that rewrites your latest run's distance on Strava to a `N.NN km` repeating-digit form (e.g. `19.19 km`, `12.12 km`). The activity stays in place — same ID, same kudos and comments — we just crop a few GPS points off the end so its distance matches the target. Garmin Connect's copy is untouched.
+Rewrite each new running activity's distance on Strava to a repeating-digit form `N.NN km` (e.g. `19.200 km → 19.19 km`, `12.4 km → 12.12 km`). All other data — pace, HR, route, elevation, kudos, comments — stays intact. Garmin Connect's copy stays untouched.
 
 ## Why this exists
 
