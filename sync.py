@@ -178,6 +178,7 @@ def run(activity_id: int | None, force: bool) -> dict:
     strava_id = strava["id"]
     log.info(f"Cropping Strava activity {strava_id} to {tgt_km} km...")
 
+    strava_url = f"https://www.strava.com/activities/{strava_id}"
     try:
         result = strava_cropper.crop_to_distance(strava_id, target_m)
     except Exception as e:
@@ -185,33 +186,26 @@ def run(activity_id: int | None, force: bool) -> dict:
             ts=ts_now, garmin_activity_id=activity_id, garmin_name=garmin_name,
             original_km=original_km, target_km=tgt_km, pipeline_path="failed",
             strava_activity_id=strava_id, final_km=None, points_dropped=None,
-            error=f"crop exception: {type(e).__name__}: {e}",
+            error=f"{type(e).__name__}: {e}",
         )
         append_history(entry)
         log.error(f"✗ FAILED  crop raised: {e}")
-        return {"ok": False, **asdict(entry),
-                "strava_url": f"https://www.strava.com/activities/{strava_id}"}
+        return {"ok": False, **asdict(entry), "strava_url": strava_url}
 
     entry = HistoryEntry(
         ts=ts_now, garmin_activity_id=activity_id, garmin_name=garmin_name,
-        original_km=original_km, target_km=tgt_km,
-        pipeline_path="cropped" if result.success else "failed",
+        original_km=original_km, target_km=tgt_km, pipeline_path="cropped",
         strava_activity_id=strava_id,
-        final_km=result.final_distance_m / 1000.0,
-        points_dropped=result.points_dropped,
-        error=result.error,
+        final_km=result["final_distance_m"] / 1000.0,
+        points_dropped=result["points_dropped"],
+        error=None,
     )
     append_history(entry)
 
-    strava_url = f"https://www.strava.com/activities/{strava_id}"
-    if result.success:
-        log.info(f"✓ DONE  cropped  {strava_url}  "
-                 f"({original_km:.4f} → {result.final_distance_m/1000:.4f} km, "
-                 f"dropped {result.points_dropped} points)")
-    else:
-        log.error(f"✗ FAILED  crop returned error: {result.error}")
-
-    return {"ok": result.success, **asdict(entry), "strava_url": strava_url}
+    log.info(f"✓ DONE  cropped  {strava_url}  "
+             f"({original_km:.4f} → {result['final_distance_m']/1000:.4f} km, "
+             f"dropped {result['points_dropped']} points)")
+    return {"ok": True, **asdict(entry), "strava_url": strava_url}
 
 
 def main() -> int:

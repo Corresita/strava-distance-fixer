@@ -1,14 +1,11 @@
-"""Thin wrapper around python-garminconnect with cached OAuth tokens.
+"""Garmin Connect login with cached OAuth1 token.
 
-Cached tokens live in ./garmin_tokens/ — subsequent runs reuse them and skip
-the full SSO + MFA dance. If the cache is invalid we fall through to a fresh
-login (interactive MFA via prompt_mfa).
+First login is interactive (MFA via prompt_mfa). After that, the token in
+./garmin_tokens/ lives ~1 year and subsequent runs skip the SSO entirely.
 """
 from __future__ import annotations
 
-import io
 import os
-import zipfile
 from pathlib import Path
 
 from garminconnect import Garmin
@@ -53,13 +50,3 @@ def latest_running_activity(client: Garmin) -> dict | None:
 
 def get_activity(client: Garmin, activity_id: int) -> dict:
     return client.get_activity(activity_id)
-
-
-def download_tcx(client: Garmin, activity_id: int) -> bytes:
-    raw = client.download_activity(activity_id, dl_fmt=Garmin.ActivityDownloadFormat.TCX)
-    # Garmin TCX downloads are sometimes returned as bare XML, sometimes zipped.
-    if zipfile.is_zipfile(io.BytesIO(raw)):
-        with zipfile.ZipFile(io.BytesIO(raw)) as z:
-            name = next(n for n in z.namelist() if n.endswith(".tcx"))
-            return z.read(name)
-    return raw

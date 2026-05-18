@@ -102,17 +102,16 @@ The first three versions of this project tried to modify activities **after** th
 ## Files
 
 ```
-sync.py              main entry point — finds latest Garmin run, waits for Strava sync, crops
+sync.py              main entry — finds latest Garmin run, waits for Strava sync, crops
 strava_cropper.py    binary-search for end_index, POST truncate form via session cookie
-garmin_client.py     Garmin Connect login + activity fetch (TCX download no longer used)
-strava_uploader.py   Strava OAuth refresh + activity search helper
+strava_uploader.py   Strava OAuth refresh, activity search, Railway env-var upsert
+garmin_client.py     Garmin Connect login + activity fetch
+sync_server.py       Flask wrapper for iOS-Shortcut / Railway use
 reauth_strava.py     one-shot Strava OAuth re-authorization helper
-sync_server.py       optional Flask wrapper for iOS-Shortcut / Railway use
-tcx_scaler.py        v2.0 GPS-path scaler — kept as reference, not wired up
 history.json         per-run record (auto-created)
 sync.log             append-only log (auto-created)
 garmin_tokens/       cached Garmin OAuth1 token (auto-created)
-docs/                journey + Strava API reference notes
+docs/                journey + v1 README archive
 ```
 
 ## Failure modes

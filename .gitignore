@@ -11,7 +11,4 @@ venv/
 garmin_tokens/
 history.json
 sync.log
-sample_*.tcx
-sample_*.fit
-sample_*.zip
 .deploy_secrets.txt
