@@ -70,6 +70,7 @@ import sync  # noqa: E402
 
 app = Flask(__name__)
 SECRET = os.environ.get("SYNC_SECRET", "")
+WEBHOOK_VERIFY = os.environ.get("STRAVA_WEBHOOK_VERIFY_TOKEN", "")
 
 
 def _authorized() -> bool:
@@ -85,6 +86,7 @@ def health():
 
 @app.route("/sync", methods=["POST"])
 def trigger_sync():
+    """Manual trigger: iOS Shortcut / curl. Runs the full Garmin → crop path."""
     if not _authorized():
         return jsonify({"error": "unauthorized"}), 401
 
@@ -106,6 +108,43 @@ def trigger_sync():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+
+@app.route("/strava-webhook", methods=["GET"])
+def strava_webhook_verify():
+    """Strava sends GET ?hub.mode=subscribe&hub.challenge=X&hub.verify_token=...
+    when first registering the subscription. Echo the challenge back."""
+    if (request.args.get("hub.mode") == "subscribe"
+            and request.args.get("hub.verify_token") == WEBHOOK_VERIFY):
+        return jsonify({"hub.challenge": request.args.get("hub.challenge")}), 200
+    print(f"[webhook] verify rejected: args={dict(request.args)}", flush=True)
+    return "forbidden", 403
+
+
+@app.route("/strava-webhook", methods=["POST"])
+def strava_webhook_event():
+    """Strava POSTs activity events here. Spawn a background thread so we
+    respond fast (Strava times out webhook responses quickly)."""
+    event = request.get_json(silent=True) or {}
+    print(f"[webhook] event: {event}", flush=True)
+
+    if event.get("object_type") == "activity" and event.get("aspect_type") == "create":
+        activity_id = event.get("object_id")
+        if activity_id:
+            import threading
+            threading.Thread(
+                target=_async_crop, args=(int(activity_id),), daemon=True
+            ).start()
+
+    return "", 200
+
+
+def _async_crop(strava_id: int) -> None:
+    try:
+        sync.crop_strava_activity(strava_id)
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[webhook] crop_strava_activity({strava_id}) raised: {e}", flush=True)
 
 
 if __name__ == "__main__":

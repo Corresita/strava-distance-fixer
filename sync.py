@@ -57,11 +57,12 @@ log = logging.getLogger("sync")
 @dataclass
 class HistoryEntry:
     ts: str
-    garmin_activity_id: int
-    garmin_name: str
+    garmin_activity_id: int | None  # None for webhook-triggered (Strava-only) runs
+    garmin_name: str  # activity name from whichever source had it
     original_km: float
     target_km: float
-    pipeline_path: str  # cropped | skipped_existing | skipped_short | no_activity | failed
+    pipeline_path: str  # cropped | skipped_existing | skipped_short | skipped_not_run
+                       # | skipped_already_at_target | no_activity | failed
     strava_activity_id: int | None
     final_km: float | None
     points_dropped: int | None
@@ -206,6 +207,86 @@ def run(activity_id: int | None, force: bool) -> dict:
              f"({original_km:.4f} → {result['final_distance_m']/1000:.4f} km, "
              f"dropped {result['points_dropped']} points)")
     return {"ok": True, **asdict(entry), "strava_url": strava_url}
+
+
+def crop_strava_activity(strava_id: int) -> dict:
+    """Webhook entry point. Called when Strava notifies us that an activity
+    was just created. Skips the Garmin lookup entirely — Strava already has
+    the just-arrived auto-synced copy, we just need to crop it.
+
+    Idempotent: if the activity is already at its N.NN target, no-op.
+    """
+    import requests
+    log.info("=" * 70)
+    log.info(f"webhook crop  strava_id={strava_id}")
+    ts_now = datetime.now().isoformat(timespec="seconds")
+
+    token = strava_uploader.get_access_token()
+    r = requests.get(
+        f"https://www.strava.com/api/v3/activities/{strava_id}",
+        headers=strava_uploader._h(token),
+        timeout=15,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"GET activity {strava_id} failed: {r.status_code}")
+    activity = r.json()
+
+    name = activity.get("name", "?")
+    sport = activity.get("sport_type") or activity.get("type", "")
+    original_m = activity.get("distance", 0) or 0
+    original_km = original_m / 1000.0
+
+    if sport not in ("Run", "TrailRun", "VirtualRun"):
+        log.info(f"  not a run ({sport}), skip")
+        return {"ok": True, "pipeline_path": "skipped_not_run",
+                "strava_activity_id": strava_id, "garmin_name": name}
+
+    if original_m < 1000:
+        log.info(f"  under 1 km, skip")
+        return {"ok": True, "pipeline_path": "skipped_short",
+                "strava_activity_id": strava_id, "garmin_name": name}
+
+    tgt_km = target_km(original_m)
+    target_m = tgt_km * 1000
+
+    # Idempotent: if already at target, no-op. Strava floors distance to 2
+    # decimals for display, so a value in [target_m, target_m+10) shows as
+    # N.NN km. Skip if we're already in that window.
+    if target_m <= original_m < target_m + 10:
+        log.info(f"  already at target {tgt_km} km (raw {original_m:.1f}m), skip")
+        return {"ok": True, "pipeline_path": "skipped_already_at_target",
+                "strava_activity_id": strava_id, "garmin_name": name,
+                "original_km": original_km, "target_km": tgt_km}
+
+    log.info(f"  {name!r}: {original_km:.4f} km → target {tgt_km} km")
+
+    try:
+        result = strava_cropper.crop_to_distance(strava_id, target_m)
+    except Exception as e:
+        entry = HistoryEntry(
+            ts=ts_now, garmin_activity_id=None, garmin_name=name,
+            original_km=original_km, target_km=tgt_km, pipeline_path="failed",
+            strava_activity_id=strava_id, final_km=None, points_dropped=None,
+            error=f"{type(e).__name__}: {e}",
+        )
+        append_history(entry)
+        log.error(f"✗ FAILED  crop raised: {e}")
+        return {"ok": False, **asdict(entry)}
+
+    entry = HistoryEntry(
+        ts=ts_now, garmin_activity_id=None, garmin_name=name,
+        original_km=original_km, target_km=tgt_km, pipeline_path="cropped",
+        strava_activity_id=strava_id,
+        final_km=result["final_distance_m"] / 1000.0,
+        points_dropped=result["points_dropped"],
+        error=None,
+    )
+    append_history(entry)
+    log.info(f"✓ DONE  webhook-cropped  https://www.strava.com/activities/{strava_id}  "
+             f"({original_km:.4f} → {result['final_distance_m']/1000:.4f} km, "
+             f"dropped {result['points_dropped']} points)")
+    return {"ok": True, **asdict(entry),
+            "strava_url": f"https://www.strava.com/activities/{strava_id}"}
 
 
 def main() -> int:
