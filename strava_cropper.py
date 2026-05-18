@@ -90,15 +90,24 @@ def _distance_stream(activity_id: int, oauth_token: str) -> list[float]:
 
 
 def _pick_end_index(distances: list[float], target_m: float) -> int:
-    """Largest index i such that distances[i] <= target_m. distances is
-    monotonically non-decreasing (cumulative meters per GPS point)."""
+    """Smallest index i such that distances[i] >= target_m. distances is
+    monotonically non-decreasing (cumulative meters per GPS point).
+
+    Why >= and not <=: Strava displays distance as floor to 2 decimals,
+    not rounded. A target of 27.27 km (=27270 m) needs the stored value
+    to land in [27270, 27280) for the UI to show "27.27 km". Picking
+    the largest index <= target_m gives 27268-ish — which floors to
+    "27.26 km", one click too low. Picking the smallest index >= target_m
+    gives 27270 or just above — which floors to "27.27 km". GPS points
+    are typically ~2 m apart so the overshoot is small (and stays well
+    inside the [target, target+10) window the floor display tolerates)."""
     lo, hi = 0, len(distances) - 1
     while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if distances[mid] <= target_m:
-            lo = mid
+        mid = (lo + hi) // 2
+        if distances[mid] >= target_m:
+            hi = mid
         else:
-            hi = mid - 1
+            lo = mid + 1
     return lo
 
 
