@@ -6,49 +6,63 @@ A small tool that rewrites each new running activity's distance on Strava to a r
 
 Strava re-derives distance from the GPS stream for any GPS activity. The API's `UpdatableActivity` schema has no `distance` field. The web edit form removed its distance input around 2024. Deleting a Garmin-synced activity via API returns 401 on default-tier apps. Every "change distance after upload" path is closed — except one: Strava's web **Crop** feature trims the GPS stream's start/end and recomputes distance, and it's reachable from outside the browser with a session cookie.
 
-The whole `docs/journey.md` documents the four approaches that failed before this one worked.
+`docs/journey.md` documents the six approaches that failed before this one worked.
 
 ## How it works
 
 ```
 Garmin watch ──▶ Garmin Connect ──▶ Strava (auto-sync, original distance)
                                             │
-                                            │ POST /activities/{id}/truncate
-                                            ▼   (start_index=0, end_index=N)
-                                    [you run sync.py]
-                                            │
+                                            │ activity-create event
                                             ▼
-                                    Strava activity now N.NN km
-                                    (same activity, all kudos retained)
+                                    POST /strava-webhook  ──▶ sync_server (on Railway)
+                                                                    │
+                                                                    │ POST /activities/{id}/truncate
+                                                                    ▼   (start_index=0, end_index=N)
+                                                            Strava activity now N.NN km
+                                                            (same activity, all kudos retained)
 ```
 
-Steps inside `sync.py`:
+Steps inside the webhook handler (`sync.crop_strava_activity`):
 
-1. Garmin: find latest running activity (cached OAuth token, no MFA after first run).
-2. Compute the `N.NN` km target from the original distance.
-3. Wait up to 3 minutes for Garmin Connect's auto-sync to push the activity to Strava (matched by start time ±15 min and distance ±10 %).
+1. Strava notifies us with the new activity's ID (a few seconds after Garmin syncs).
+2. `GET /api/v3/activities/{id}` → distance and sport type. Skip if not a run, under 1 km, or already at the `N.NN` target.
+3. Compute the `N.NN` km target.
 4. `GET /api/v3/activities/{id}/streams?keys=distance` → cumulative-meters array, one entry per GPS point.
-5. Binary-search for the largest index whose cumulative distance is ≤ the target.
+5. Binary-search for the smallest index whose cumulative distance is **≥** the target (Strava displays distance as floor to 2 decimals, so we overshoot slightly to land on `N.NN`).
 6. `GET /activities/{id}/truncate` (with session cookie) → scrape Rails CSRF token from the form.
 7. `POST /activities/{id}/truncate` with `start_index=0, end_index=<computed>`. Strava re-derives distance from the trimmed range.
 
 What changes:
-- Activity's distance becomes ≤ target (typically within 2-3 m, since GPS points are ~3 m apart).
+- Activity's distance becomes the closest GPS-point distance ≥ target (typically within a few meters of target).
 - A few GPS points at the end of the route are permanently dropped.
 
 What stays untouched:
-- Activity ID, kudos, comments, name, sport type — none of that is recreated.
+- Activity ID, kudos, comments, name, sport type.
 - HR / cadence / power / altitude — Strava preserves these streams across crop.
 - Garmin Connect — the script never writes to Garmin. The full original recording stays in Garmin Connect with all private analytics (Body Battery, Hill Score, Training Effect).
 
-Strava's own UI warns "This action cannot be undone." Cropped GPS points really are gone. For a 19.200 km run trimmed to 19.19 km, that's ~10 m off the end of the route — invisible. For an 8.32 km run trimmed to 8.08 km, that's ~240 m — small but visible if you look at the map closely.
+Strava's UI warns "This action cannot be undone." Cropped GPS points really are gone. For a 19.200 km run trimmed to 19.19 km, that's ~10 m off the end of the route — invisible. For an 8.32 km run trimmed to 8.08 km, that's ~240 m — small but visible if you look at the map closely.
+
+## Triggers
+
+There are three ways to invoke the same crop pipeline. The webhook is the default; the others are for fallback and ad-hoc use.
+
+| Trigger | When it fires | Code path |
+| --- | --- | --- |
+| **Strava webhook** (default) | Automatic, seconds after Garmin → Strava sync completes | `POST /strava-webhook` → `sync.crop_strava_activity()` |
+| iOS Shortcut (backup) | You tap a Home Screen icon | `POST /sync` with `X-Sync-Secret` → `sync.run()` (does the full Garmin lookup + wait + crop) |
+| CLI (debug / backfill) | You run a command on your laptop | `python sync.py [activity_id] [--force]` → same `sync.run()` |
+
+All three end up calling `strava_cropper.crop_to_distance()` with the same target and producing the same result.
 
 ## Requirements
 
 - Garmin Connect → Strava direct sync **enabled** (Garmin Connect → Settings → Connected Apps → Strava). The auto-synced activity is what we crop.
-- Strava API app credentials (https://www.strava.com/settings/api) with `activity:read_all` scope (for the streams API). `activity:write` is not used by the crop path but is harmless to keep.
+- Strava API app credentials (https://www.strava.com/settings/api) with `activity:read_all` scope.
 - A Strava web session cookie (`_strava4_session`) captured from a logged-in browser — see `.env.example`.
 - Python 3.12+, dependencies in `requirements.txt`.
+- A publicly reachable HTTPS endpoint for the webhook (Railway works well; the repo has `Procfile` + `railway.toml`).
 
 ## Setup
 
@@ -57,88 +71,78 @@ Strava's own UI warns "This action cannot be undone." Cropped GPS points really 
 conda activate strava-fixer    # or your venv
 pip install -r requirements.txt
 
-# Credentials
+# Credentials — fill in everything in .env.example
 cp .env.example .env
-# Fill in GARMIN_EMAIL / GARMIN_PASSWORD, Strava CLIENT_ID / CLIENT_SECRET,
-# and STRAVA_SESSION_COOKIE (see .env.example for where to copy that from).
 
 # Authorize Strava OAuth (opens browser, captures the code on localhost:8765)
 python reauth_strava.py
 ```
 
-The Strava app's "Authorization Callback Domain" in https://www.strava.com/settings/api must be `localhost` for `reauth_strava.py` to receive the OAuth callback.
+Strava app's "Authorization Callback Domain" in https://www.strava.com/settings/api must be `localhost` for `reauth_strava.py` to receive the OAuth callback.
 
-## Usage
+First Garmin login is interactive (one-time): a 6-digit MFA code arrives by email, you paste it. After that the cached token in `garmin_tokens/` lives ~1 year.
+
+Then deploy the server and register the webhook:
 
 ```bash
-python sync.py                  # process latest Garmin running activity
-python sync.py 22903731984      # process a specific Garmin activity ID
-python sync.py --force          # re-process even if history.json has it
+# 1. Push to Railway (or any host that runs Procfile / gunicorn). Add all .env
+#    values as Railway env vars. The four RAILWAY_* vars enable auto-rotation
+#    of refreshed Strava tokens & session cookies back into Railway storage.
+# 2. Capture the Garmin token into a Railway env var for fresh-container bootstrap:
+python -c "import base64,pathlib; print(base64.b64encode(pathlib.Path('garmin_tokens/garmin_tokens.json').read_bytes()).decode())"
+# Paste the output as GARMIN_TOKEN_B64 on Railway.
+# 3. Pick a random string for STRAVA_WEBHOOK_VERIFY_TOKEN; put it in .env locally
+#    AND on Railway.
+# 4. After Railway is deployed and healthy, register the webhook:
+python subscribe_webhook.py
 ```
 
-Wall-clock: a few seconds plus however long Garmin takes to push to Strava (typically ~1 minute after a run ends; the script polls for up to 3 minutes).
+`subscribe_webhook.py` deletes any existing subscription (Strava allows only one per app), then registers a fresh one pointing at the Railway domain. Strava verifies by hitting our `/strava-webhook` GET handler with the verify token; sync_server echoes the challenge back if the token matches.
 
-```
-$ python sync.py
-2026-05-16 19:00:00  INFO  Logging into Garmin...
-2026-05-16 19:00:01  INFO  Looking up latest running activity...
-2026-05-16 19:00:02  INFO  Activity 22903731984: 'Morning Run'  8.1240 km  start=2026-05-16T15:55:57Z
-2026-05-16 19:00:02  INFO  Target: 8.08 km (8080 m)
-2026-05-16 19:00:02  INFO    waiting up to 180s for Garmin → Strava auto-sync...
-2026-05-16 19:00:03  INFO    found Strava activity 18532273416 (8.1240 km)
-2026-05-16 19:00:03  INFO  Cropping Strava activity 18532273416 to 8.08 km...
-[crop]   stream has 2672 points, original distance 8086.30m
-[crop]   chosen end_index=2669 -> distance 8079.80m (dropping 2 points, 6.5m off the end)
-[crop]   POST truncate -> 200
-2026-05-16 19:00:05  INFO  ✓ DONE  cropped  https://www.strava.com/activities/18532273416  (8.1240 → 8.0798 km, dropped 2 points)
-```
+Optional (only if you want phone-triggered backup):
+- Create an iOS Shortcut with three actions: `Get Contents of URL` (POST to `https://<railway>/sync` with header `X-Sync-Secret: <SYNC_SECRET>`), `Get Dictionary Value` (key `strava_url`), `Show Notification`. Add to Home Screen.
 
-The first Garmin login is interactive: a 6-digit MFA code arrives by email, you paste it in. Subsequent runs reuse the cached OAuth token in `garmin_tokens/` (good for ~1 year) and skip the MFA dance entirely.
+## Failure modes
 
-## How we got here
+- **Webhook fires but crop fails** — `history.json` records `pipeline_path=failed` and the exception. Tap the iOS Shortcut or `python sync.py --force` to retry. The Strava activity is untouched on failure (we only ever POST `truncate` if everything before it succeeded).
+- **Webhook doesn't fire** — usually a Strava subscription issue. Re-run `python subscribe_webhook.py`. Verify with `curl https://www.strava.com/api/v3/push_subscriptions?client_id=...&client_secret=...`.
+- **`401 / login redirect` at the crop step** — `_strava4_session` cookie expired. Recapture from a logged-in browser, update the env var (and Railway).
+- **Garmin token cache expired (~1 year)** — re-login locally with `python sync.py` (it'll prompt for MFA), then regenerate `GARMIN_TOKEN_B64` and update Railway.
+- **Activity under 1 km / already at target** — skipped silently, recorded as `skipped_short` / `skipped_already_at_target` in history.
 
-The first three versions of this project tried to modify activities **after** they reached Strava — via the Strava API, then via web-form simulation. Both hit walls. See [docs/journey.md](docs/journey.md) for the full story of what we tried (Strava API → web form → Garmin Developer API → garth) and why each one didn't survive contact with reality. The v1 webhook README is archived at [docs/README-v1-archive.md](docs/README-v1-archive.md).
+In every failure mode the Strava activity is left exactly as Garmin's auto-sync delivered it.
 
 ## Files
 
 ```
-sync.py              main entry — finds latest Garmin run, waits for Strava sync, crops
+sync.py              entry point: run() for CLI/Shortcut path, crop_strava_activity() for webhook path
+sync_server.py       Flask server: /sync (manual), /strava-webhook (auto), / (health)
 strava_cropper.py    binary-search for end_index, POST truncate form via session cookie
 strava_uploader.py   Strava OAuth refresh, activity search, Railway env-var upsert
-garmin_client.py     Garmin Connect login + activity fetch
-sync_server.py       Flask wrapper for iOS-Shortcut / Railway use
-reauth_strava.py     one-shot Strava OAuth re-authorization helper
+garmin_client.py     Garmin Connect login + activity fetch (used by CLI/Shortcut path only)
+reauth_strava.py     one-shot Strava OAuth re-authorization
+subscribe_webhook.py one-shot Strava push-subscription registration
 history.json         per-run record (auto-created)
 sync.log             append-only log (auto-created)
 garmin_tokens/       cached Garmin OAuth1 token (auto-created)
 docs/                journey + v1 README archive
 ```
 
-## Failure modes
+## `history.json`
 
-- **Strava auto-synced copy not found within 3 min** — the script logs failure with `pipeline_path=failed` and exits. Try again in a few minutes once Garmin Connect has pushed.
-- **Crop returns HTTP 401 / login redirect** — your `_strava4_session` cookie expired. Recapture it from a browser (see `.env.example`) and update the env var.
-- **Crop returns HTTP 5xx** — Strava-side issue, transient. `history.json` records the error. Re-run with `--force` later.
-- **Garmin token cache expired (~1 year)** — first run after that needs a fresh interactive login with MFA. Re-run from a terminal with your email open, paste the code, done.
-- **Activity is under 1 km** — skipped silently (N.NN with N=0 isn't a meaningful target).
-
-In all failure modes, the Strava activity itself is left exactly as Garmin's auto-sync delivered it. Nothing is destroyed; the worst case is your distance doesn't get the cosmetic trim.
-
-## history.json
-
-Each `sync.py` run appends one record. Useful fields:
+Each crop appends one record:
 
 | Field | Meaning |
 | --- | --- |
-| `pipeline_path` | `cropped` (success) / `skipped_existing` / `skipped_short` / `no_activity` / `failed` |
-| `original_km` / `target_km` | Original distance reported by Garmin and the `N.NN` target |
-| `final_km` | Distance Strava ended up showing after the crop |
-| `points_dropped` | How many GPS points we trimmed off the end |
-| `strava_activity_id` | The Strava activity we modified (unchanged across runs) |
+| `pipeline_path` | `cropped` / `skipped_existing` / `skipped_short` / `skipped_not_run` / `skipped_already_at_target` / `no_activity` / `failed` |
+| `garmin_activity_id` | The Garmin activity, or `null` if triggered via webhook (didn't go through Garmin) |
+| `original_km` / `target_km` / `final_km` | Original, target, and final-on-Strava distance |
+| `points_dropped` | GPS points trimmed off the end |
+| `strava_activity_id` | The Strava activity we modified |
 | `error` | Diagnostic string when something went wrong, else `null` |
 
 ## Security notes
 
-`.env` is gitignored. Never commit it. The Garmin token cache in `garmin_tokens/` is also gitignored — it's an OAuth1 token, not your password, but treat it like a credential.
+`.env` and `garmin_tokens/` are gitignored. Treat the Garmin OAuth1 token like a credential — it grants ~1 year of read access to the account. The `_strava4_session` cookie grants whatever a logged-in browser can do on Strava; if it leaks, sign out everywhere in Strava settings and recapture.
 
-The Strava access token refreshes itself when expired; refreshed tokens are written back to `.env`.
+Strava OAuth tokens refresh themselves when expired; refreshed values are written back to `.env` (local) and Railway env vars (when the four `RAILWAY_*` vars are configured). The `_strava4_session` cookie rotates the same way after each successful crop — as long as the pipeline runs at least once every few weeks, the cookie effectively never expires.

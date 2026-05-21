@@ -1,5 +1,40 @@
 # Changelog
 
+## [2.4.0] - 2026-05-18
+
+Full automation. Strava pushes activity-create events to `/strava-webhook` on Railway; sync_server spawns a background thread that crops the activity in ~5 seconds. No phone tap, no laptop. iOS Shortcut and CLI are kept as backup paths against the day the webhook or the crop form changes.
+
+### Added
+- `sync.crop_strava_activity(strava_id)` — webhook entry point. Skips the Garmin lookup since Strava just told us the activity ID. Idempotent via `[target_m, target_m+10)` window check.
+- `sync_server.py`: `GET /strava-webhook` (hub.challenge handshake), `POST /strava-webhook` (event receiver, threads off to keep response under Strava's timeout).
+- `subscribe_webhook.py` — one-shot CLI that deletes any existing subscription (Strava allows one per app) and registers a fresh one pointing at the Railway domain.
+- `STRAVA_WEBHOOK_VERIFY_TOKEN` env var (shared between subscribe_webhook and the GET verify handler).
+- `pipeline_path` values: `skipped_not_run`, `skipped_already_at_target`.
+- `HistoryEntry.garmin_activity_id` is now `int | None` (`None` for webhook-triggered runs).
+
+### Verified
+- 2026-05-20: runs after a Garmin auto-sync, Strava activity becomes `N.NN km` within seconds of the webhook firing. Logs in Railway show the full pipeline. iOS Shortcut and CLI continue to work as backup.
+
+---
+
+## [2.3.0] - 2026-05-17
+
+Credential auto-rotation. Refreshed Strava OAuth tokens and rotated `_strava4_session` cookies are pushed back to Railway's project variables via the GraphQL `variableCollectionUpsert` mutation. As long as sync runs at least once every few weeks, the cookie effectively never expires.
+
+### Added
+- `_railway_upsert_vars()` in `strava_uploader.py`. Calls Railway's GraphQL API to upsert env vars; silently noops without the four `RAILWAY_*` env vars.
+- `_persist_env()` updates os.environ even when `.env` is absent (Railway containers don't have a `.env`).
+- Cookie capture from `requests.Session.cookies` after the `truncate` POST, with auto-persist.
+- `RAILWAY_API_TOKEN`, `RAILWAY_PROJECT_ID`, `RAILWAY_SERVICE_ID`, `RAILWAY_ENVIRONMENT_ID` env vars.
+
+### Fixed
+- `_pick_end_index` now picks the smallest index whose cumulative distance is `≥` target, not the largest `≤`. Strava displays distance with floor truncation to 2 decimals, so the old algorithm landed at `N.NN - 0.01`. New algorithm overshoots by ~2 m (GPS spacing) into the `[target, target+10)` floor-display window, landing at `N.NN`.
+
+### Removed
+- `tcx_scaler.py`, `strava_uploader.upload_tcx`, `strava_uploader.delete_activity`, `garmin_client.download_tcx` — dead code from the v2.0–v2.1 TCX-scaling and delete+reupload pipelines. Total: 1200 → 824 LOC (-31%).
+
+---
+
 ## [2.2.0] - 2026-05-16
 
 Pipeline pivot: replace the "delete the auto-synced Strava copy, upload a scaled version" approach (blocked by Strava's `DELETE` 401 — see 2.1.0) with **modify the existing Strava activity in place** by replaying its web "Crop / truncate" form. Same activity ID, same kudos, same comments — just trim a few GPS points off the end to land on N.NN km.

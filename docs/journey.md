@@ -253,6 +253,44 @@ iPhone notification: "Strava Fix: https://strava.com/activities/…"
 
 Cost of ownership: opening Garmin Connect once a year to re-issue a token. That's it.
 
+## Approach 8: Strava webhook auto-trigger (v2.4, the actual end state)
+
+v2.3 is a feature you tap. Most runs end with the user not next to their phone, or already focused on something else. "Open phone, tap icon, wait, dismiss notification" is small but real friction.
+
+The fix turned out to be where this project started, six versions ago: a **Strava webhook**. The v1.0 receiver was the right shape; v1.0's only real mistake was what it *did* on the event. Once we knew to call the web `truncate` form instead of the OAuth `PUT /activities/{id}`, the same architecture works.
+
+**What changed for v2.4.**
+
+- `sync_server.py` gained two endpoints. `GET /strava-webhook` echoes Strava's `hub.challenge` to complete the subscription handshake. `POST /strava-webhook` accepts activity events; on `aspect_type=create` it spawns a background thread so Strava's webhook timeout isn't blocked.
+- New `sync.crop_strava_activity(strava_id)`: the webhook entry point. Skips Garmin entirely — Strava just told us the activity ID. Fetches the activity from Strava's API for distance + sport type, computes the `N.NN` target, calls the shared `strava_cropper.crop_to_distance()`. Idempotent via a `[target_m, target_m+10)` window check so any duplicate or re-delivered event is a no-op.
+- `subscribe_webhook.py`: one-shot CLI that deletes any existing subscription (Strava allows one per OAuth app) and registers a fresh one pointing at the Railway domain.
+
+**One subtle floor-display bug we caught and fixed late.** Strava displays distance as `floor(stored_m / 10) / 100`, **not** rounded. The original cropper picked the largest index where `distance ≤ target`, which lands a couple of meters under target and floors to `N.NN - 0.01`. Visible immediately on a 27.30 km → 27.27 target attempt that landed at 27.2680 m and displayed as `27.26 km`. The fix: pick the *smallest* index where `distance ≥ target`. GPS points are ~2 m apart so the overshoot stays well inside the `[target, target+10)` window the floor display tolerates. (The 27.26 activity is stuck — Strava crop is irreversible.)
+
+**End-state architecture (v2.4, verified 2026-05-20):**
+
+```
+Garmin watch ──▶ Garmin Connect ──▶ Strava (auto-sync, original distance)
+                                            │
+                                            │ POST /strava-webhook
+                                            ▼   (activity-create event)
+                                    Railway sync_server
+                                            │ (background thread)
+                                            ├─ GET /activities/{id}
+                                            ├─ GET /activities/{id}/streams
+                                            ├─ binary-search for end_index
+                                            ├─ GET /activities/{id}/truncate (CSRF)
+                                            └─ POST /activities/{id}/truncate
+                                            │
+                                            ▼
+                                    Strava activity now N.NN km
+                                    (~5 s after Strava receives the auto-sync)
+```
+
+iOS Shortcut and the CLI are kept as backup paths against the day the webhook or the crop form changes. Three different triggers, one shared crop function.
+
+**Cost of ownership at v2.4:** nothing. The cookie auto-rotates, the OAuth tokens auto-refresh, the Garmin token is good for a year. The only manual operation is rotating the Garmin token annually.
+
 ## Lessons
 
 - **Don't try to modify data Strava already owns.** Strava treats every GPS activity's distance as a derived value. There is no API and no UI surface to override it, and the company appears to be removing the few that existed.
@@ -261,6 +299,8 @@ Cost of ownership: opening Garmin Connect once a year to re-issue a token. That'
 - **Test with the actual page, not just the API.** We spent v1.5 building a web form scraper assuming the distance field still existed in the HTML. It didn't. One DevTools peek would have saved that work.
 - **A working pipeline isn't a finished feature.** v2.1 deploys, the iOS Shortcut fires, the server responds — looks complete. But the Strava `DELETE` step it depends on silently 401s in production. Always probe each step's actual *outcome* on the real target, not just whether the code ran.
 - **Token rotation doesn't mean token replacement.** After regenerating Strava's Client Secret and re-authorizing, the old refresh token was still active (Strava reuses refresh tokens across re-auths within the same grant context). We had to explicitly *revoke* the app in Strava settings before reauth would actually mint a new refresh token.
+- **The right architecture from day one was a webhook.** v1.0 was a Flask service receiving Strava activity-create events on Railway. v2.4 is — almost identically — a Flask service receiving Strava activity-create events on Railway. Six versions in between were all wrong about the *call to make on the event*, not wrong about the trigger shape. The discovery work (web Crop form, session-cookie auth, CSRF parsing, floor display) was the entire content of those six versions. Architecturally, the project ends where it started.
+- **Verify on the actual UI, not the API response.** Today's crop log said `27.2680m → 27.27 km`. The Strava API echoed that distance. Strava's web UI displayed `27.26 km`. The whole `27.27 → 27.26` floor-display bug would have been visible if the first crop test had ended with a screenshot of Strava's activity page, not just a JSON dump.
 
 ## Archive
 
