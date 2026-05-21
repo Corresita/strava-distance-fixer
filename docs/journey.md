@@ -1,6 +1,6 @@
 # Project journey
 
-A record of the four approaches we tried before landing on what works. Kept so the next person (or future-me) doesn't have to repeat the same dead ends.
+A record of every approach we tried — eight in total. Six were dead ends; two work and run in production today (manual crop in v2.2, webhook auto-trigger in v2.4). Kept so the next person (or future-me) doesn't have to repeat the dead ends.
 
 ## The goal
 

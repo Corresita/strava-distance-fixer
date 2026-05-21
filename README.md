@@ -6,7 +6,7 @@ A small tool that rewrites each new running activity's distance on Strava to a r
 
 Strava re-derives distance from the GPS stream for any GPS activity. The API's `UpdatableActivity` schema has no `distance` field. The web edit form removed its distance input around 2024. Deleting a Garmin-synced activity via API returns 401 on default-tier apps. Every "change distance after upload" path is closed — except one: Strava's web **Crop** feature trims the GPS stream's start/end and recomputes distance, and it's reachable from outside the browser with a session cookie.
 
-`docs/journey.md` documents the six approaches that failed before this one worked.
+[docs/journey.md](docs/journey.md) walks through all eight approaches we tried — six dead ends, the manual crop that worked (v2.2), and the Strava webhook that closes the loop back to the original v1 architecture (v2.4).
 
 ## How it works
 
